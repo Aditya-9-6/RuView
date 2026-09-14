@@ -2635,6 +2635,76 @@ mod calibration_expiry_tests {
         state
     }
 
+    fn state_with_receipt() -> AppStateInner {
+        let mut state = state_with_model(false);
+        state.calibration_session_id = Some("cal-session-test".to_string());
+        state.calibration_model_id = Some("cal-model-test".to_string());
+        state.calibration_binding_digest = Some("ab".repeat(32));
+        state.calibration_model_receipt = Some(CalibrationModelReceipt {
+            schema: field_bridge::CALIBRATION_MODEL_RECEIPT_SCHEMA,
+            boot_epoch: state.calibration_boot_epoch.clone(),
+            session_id: "cal-session-test".to_string(),
+            model_id: "cal-model-test".to_string(),
+            binding_digest: "ab".repeat(32),
+            source_node_ids: vec![5],
+            frame_count: 1_000,
+            variance_explained: 0.9,
+            baseline_eigenvalue_count: 1,
+            completed_at_unix_ms: 1_000,
+        });
+        state
+    }
+
+    /// The Mac app's held-out empty check consumes this evidence and refuses to
+    /// store a startup baseline without it. Assert the wire schema and every
+    /// identity field the client matches against its receipt.
+    #[test]
+    fn calibrated_presence_evidence_binds_the_active_model_receipt() {
+        let state = state_with_receipt();
+        let evidence = state
+            .calibrated_presence_evidence(5, 77, 1_500)
+            .expect("a fresh explicit calibration must publish calibrated evidence");
+
+        assert_eq!(
+            evidence.schema,
+            "ruview.calibration.calibrated-presence-evidence.v2"
+        );
+        assert_eq!(evidence.boot_epoch, state.calibration_boot_epoch);
+        assert_eq!(evidence.session_id, "cal-session-test");
+        assert_eq!(evidence.model_id, "cal-model-test");
+        assert_eq!(evidence.binding_digest, "ab".repeat(32));
+        assert_eq!(evidence.source_node_ids, vec![5]);
+        assert_eq!(evidence.model_completed_at_unix_ms, 1_000);
+        assert_eq!(evidence.inference_node_id, 5);
+        assert_eq!(evidence.source_tick, 77);
+        assert_eq!(evidence.observed_at_unix_ms, 1_500);
+        assert!(!evidence.inference_method.is_empty());
+
+        // The evidence and the server's own count come from one model and one
+        // history, so they can never disagree.
+        assert_eq!(evidence.person_count, state.person_count_at(1_500));
+        assert_eq!(evidence.presence, evidence.person_count > 0);
+    }
+
+    /// Absence must mean "not calibrated", never "the path is broken", so pair
+    /// each refusal with the positive case above.
+    #[test]
+    fn calibrated_presence_evidence_absent_without_an_explicit_fresh_calibration() {
+        // No receipt: the model cannot be attributed to a bound room.
+        let mut no_receipt = state_with_receipt();
+        no_receipt.calibration_model_receipt = None;
+        assert!(no_receipt.calibrated_presence_evidence(5, 77, 1_500).is_none());
+
+        // Bootstrap authority is negative-only and must never publish evidence.
+        let mut bootstrap = state_with_receipt();
+        bootstrap.bootstrap_baseline_active = true;
+        assert!(bootstrap.calibrated_presence_evidence(5, 77, 1_500).is_none());
+
+        // An expired model scores nothing.
+        let expired = state_with_receipt();
+        assert!(expired.calibrated_presence_evidence(5, 77, u64::MAX / 2).is_none());
+    }
+
     #[test]
     fn bootstrap_field_model_remains_negative_only_for_person_count() {
         let runtime = state_with_model(false);
