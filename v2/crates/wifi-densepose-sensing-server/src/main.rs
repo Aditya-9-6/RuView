@@ -397,6 +397,30 @@ struct CalibrationModelReceipt {
     completed_at_unix_ms: u64,
 }
 
+/// Per-frame occupancy result bound to one immutable field-model calibration
+/// receipt. Absent whenever the model is stale, unavailable, or cannot score
+/// the current observation without a heuristic fallback, so a consumer can
+/// never mistake a fallback for calibrated evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CalibratedPresenceEvidence {
+    schema: String,
+    boot_epoch: String,
+    session_id: String,
+    model_id: String,
+    binding_digest: String,
+    source_node_ids: Vec<u8>,
+    model_completed_at_unix_ms: u64,
+    inference_node_id: u8,
+    source_tick: u64,
+    observed_at_unix_ms: u64,
+    inference_method: String,
+    presence: bool,
+    person_count: usize,
+}
+
+const CALIBRATED_PRESENCE_EVIDENCE_SCHEMA: &str =
+    "ruview.calibration.calibrated-presence-evidence.v2";
+
 /// Sensing update broadcast to WebSocket clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SensingUpdate {
@@ -412,6 +436,10 @@ struct SensingUpdate {
     /// Vital sign estimates (breathing rate, heart rate, confidence).
     #[serde(skip_serializing_if = "Option::is_none")]
     vital_signs: Option<VitalSigns>,
+    /// Strict calibrated occupancy evidence for this frame, bound to the
+    /// active model receipt. Omitted when no calibrated result is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    calibrated_presence_evidence: Option<CalibratedPresenceEvidence>,
     // ── ADR-022 Phase 3: Enhanced multi-BSSID pipeline fields ──
     /// Enhanced motion estimate from multi-BSSID pipeline.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2229,6 +2257,78 @@ impl AppStateInner {
     /// "esp32:offline" so the UI can distinguish active vs stale connections.
     /// Person count: eigenvalue-based if field model is calibrated, else heuristic.
     /// Uses global frame_history if populated, otherwise the freshest per-node history.
+    /// The single source node a single-link model is allowed to score, when
+    /// the active calibration (or a restored bootstrap image) bound exactly
+    /// one. `None` means no single node owns the baseline.
+    fn bound_source_node_id(&self) -> Option<u8> {
+        (self.calibration_source_node_ids.len() == 1)
+            .then(|| self.calibration_source_node_ids.iter().next().copied())
+            .flatten()
+            .or_else(|| {
+                self.bootstrap_baseline.as_ref().and_then(|metadata| {
+                    (metadata.source_node_ids.len() == 1)
+                        .then_some(metadata.source_node_ids[0])
+                })
+            })
+    }
+
+    /// Frame history the field model scores. Shared by `person_count_at` and
+    /// the calibrated presence evidence so the published evidence can never
+    /// disagree with the count derived from the same model.
+    fn scoring_history(&self) -> &VecDeque<Vec<f64>> {
+        if let Some(node_id) = self.bound_source_node_id() {
+            self.node_states
+                .get(&node_id)
+                .map(|state| &state.field_model_history)
+                .unwrap_or(&self.frame_history)
+        } else if !self.frame_history.is_empty() {
+            &self.frame_history
+        } else {
+            self.node_states
+                .values()
+                .filter(|ns| !ns.frame_history.is_empty())
+                .max_by_key(|ns| ns.last_frame_time)
+                .map(|ns| &ns.frame_history)
+                .unwrap_or(&self.frame_history)
+        }
+    }
+
+    /// Strict per-frame calibrated occupancy evidence bound to the active
+    /// model receipt. Returns `None` unless an explicit calibration is fresh
+    /// and the field model scores the observation without falling back to the
+    /// heuristic, so a consumer may treat a present value as calibrated.
+    fn calibrated_presence_evidence(
+        &self,
+        inference_node_id: u8,
+        source_tick: u64,
+        observed_at_unix_ms: u64,
+    ) -> Option<CalibratedPresenceEvidence> {
+        if !self.explicit_calibration_fresh_at(observed_at_unix_ms) {
+            return None;
+        }
+        let receipt = self.calibration_model_receipt.as_ref()?;
+        let occupancy = field_bridge::calibrated_occupancy(
+            self.field_model.as_ref()?,
+            self.scoring_history(),
+            observed_at_unix_ms.saturating_mul(1_000),
+        )?;
+        Some(CalibratedPresenceEvidence {
+            schema: CALIBRATED_PRESENCE_EVIDENCE_SCHEMA.to_string(),
+            boot_epoch: receipt.boot_epoch.clone(),
+            session_id: receipt.session_id.clone(),
+            model_id: receipt.model_id.clone(),
+            binding_digest: receipt.binding_digest.clone(),
+            source_node_ids: receipt.source_node_ids.clone(),
+            model_completed_at_unix_ms: receipt.completed_at_unix_ms,
+            inference_node_id,
+            source_tick,
+            observed_at_unix_ms,
+            inference_method: occupancy.method.wire_name().to_string(),
+            presence: occupancy.person_count > 0,
+            person_count: occupancy.person_count,
+        })
+    }
+
     fn person_count_at(&self, observed_at_unix_ms: u64) -> usize {
         // A persisted bootstrap model has negative-only authority. Its only
         // allowed occupancy effect is the explicit empty-background suppression
@@ -2242,30 +2342,7 @@ impl AppStateInner {
                 // calibrated against. Applying one node's baseline to a
                 // different radio creates deterministic false occupancy from
                 // hardware-specific amplitude offsets.
-                let bound_source_node_id = (self.calibration_source_node_ids.len() == 1)
-                    .then(|| self.calibration_source_node_ids.iter().next().copied())
-                    .flatten()
-                    .or_else(|| {
-                        self.bootstrap_baseline.as_ref().and_then(|metadata| {
-                            (metadata.source_node_ids.len() == 1)
-                                .then_some(metadata.source_node_ids[0])
-                        })
-                    });
-                let history = if let Some(node_id) = bound_source_node_id {
-                    self.node_states
-                        .get(&node_id)
-                        .map(|state| &state.field_model_history)
-                        .unwrap_or(&self.frame_history)
-                } else if !self.frame_history.is_empty() {
-                    &self.frame_history
-                } else {
-                    self.node_states
-                        .values()
-                        .filter(|ns| !ns.frame_history.is_empty())
-                        .max_by_key(|ns| ns.last_frame_time)
-                        .map(|ns| &ns.frame_history)
-                        .unwrap_or(&self.frame_history)
-                };
+                let history = self.scoring_history();
                 field_bridge::occupancy_or_fallback(
                     fm,
                     history,
@@ -4112,6 +4189,7 @@ async fn wifi_task(state: SharedState, tick_ms: u64) {
                 &sub_variances,
             ),
             vital_signs: None,
+            calibrated_presence_evidence: None,
             enhanced_motion,
             enhanced_breathing,
             posture: posture_str,
@@ -4277,6 +4355,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
             &sub_variances,
         ),
         vital_signs: None,
+        calibrated_presence_evidence: None,
         enhanced_motion: None,
         enhanced_breathing: None,
         posture: None,
@@ -9405,6 +9484,11 @@ async fn udp_receiver_task(
                         let _ = s.tx.send(json);
                     }
 
+                    let calibrated_presence_evidence = s.calibrated_presence_evidence(
+                        node_id,
+                        tick,
+                        chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    );
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
@@ -9415,6 +9499,7 @@ async fn udp_receiver_task(
                         classification,
                         signal_field,
                         vital_signs: published_vitals,
+                        calibrated_presence_evidence,
                         enhanced_motion: None,
                         enhanced_breathing: None,
                         posture: None,
@@ -9908,6 +9993,11 @@ async fn udp_receiver_task(
                         total_persons,
                     );
 
+                    let calibrated_presence_evidence = s.calibrated_presence_evidence(
+                        node_id,
+                        tick,
+                        chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    );
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
@@ -9929,6 +10019,7 @@ async fn udp_receiver_task(
                             &sub_variances,
                         ),
                         vital_signs: published_vitals,
+                        calibrated_presence_evidence,
                         enhanced_motion: None,
                         enhanced_breathing: None,
                         posture: None,
@@ -10184,6 +10275,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
                 &sub_variances,
             ),
             vital_signs: None,
+            calibrated_presence_evidence: None,
             enhanced_motion: None,
             enhanced_breathing: None,
             posture: None,
@@ -12953,6 +13045,7 @@ mod observatory_persons_field_position_tests {
             },
             signal_field,
             vital_signs: None,
+            calibrated_presence_evidence: None,
             enhanced_motion: None,
             enhanced_breathing: None,
             posture: None,
