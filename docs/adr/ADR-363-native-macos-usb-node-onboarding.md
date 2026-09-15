@@ -1,4 +1,4 @@
-# ADR 348: Native macOS USB node onboarding
+# ADR 363: Native macOS USB node onboarding
 
 ## Status
 
