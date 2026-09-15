@@ -13,12 +13,16 @@ mod adaptive_classifier;
 pub mod cli;
 pub mod csi;
 mod engine_bridge;
+mod live_trust;
+mod authenticated_ingest;
+mod trust_audit;
 mod field_bridge;
 mod field_localize;
 mod model_format;
 mod multistatic_bridge;
 mod mediatek_csi;
 mod qualcomm_csi;
+mod realtek_csi;
 mod realtek_radar;
 mod path_safety;
 pub mod pose;
@@ -236,6 +240,12 @@ struct Args {
     #[arg(long)]
     calibrate: bool,
 
+    /// Signed ADR-300 live-trust configuration. When supplied, startup fails
+    /// closed unless both verifier secrets are present and the certificate
+    /// identities agree. Every accepted ESP32 CSI frame is then evaluated.
+    #[arg(long, value_name = "PATH", env = "RUVIEW_TRUST_CONFIG")]
+    trust_config: Option<PathBuf>,
+
     // ---------------------------------------------------------------
     // ADR-102: Edge Module Registry — surface the canonical Cognitum
     // cog catalog via `GET /api/v1/edge/registry`.
@@ -354,6 +364,10 @@ struct SensingUpdate {
     /// fresh node backs the room rather than a frozen online value.
     #[serde(skip_serializing_if = "Option::is_none")]
     room_inference: Option<RoomInference>,
+    /// ADR-300 live calibration -> OOD -> capability -> policy result for the
+    /// frame. Present on hardware frames when the monitor is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    perception_trust: Option<live_trust::LiveTrustSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1253,6 +1267,11 @@ struct AppStateInner {
     latest_qualcomm_csi: Option<qualcomm_csi::QualcommCsiSnapshot>,
     /// Instant of the last validated Qualcomm CSI UDP frame.
     last_qualcomm_frame: Option<std::time::Instant>,
+    /// Latest validated Realtek RTL8721Dx CSI summary (ADR-323); distinct from
+    /// `latest_realtek_radar` (RTL8720F FMCW radar, a different Realtek part).
+    latest_realtek_csi: Option<realtek_csi::RealtekCsiSnapshot>,
+    /// Instant of the last validated Realtek RTL8721Dx CSI UDP frame.
+    last_realtek_csi_frame: Option<std::time::Instant>,
     /// Latest bounded ADR-270 event per vendor. Complex CSI uses dedicated transports.
     latest_vendor_rf: BTreeMap<String, wifi_densepose_sensing_server::vendor_rf::VendorEventSnapshot>,
     tx: broadcast::Sender<String>,
@@ -1357,6 +1376,10 @@ struct AppStateInner {
     /// exposed via `GET /api/v1/status`, and a Restricted-class cycle strips
     /// per-node raw amplitudes from the live publish (review finding 1).
     engine_bridge: engine_bridge::EngineBridge,
+    /// ADR-300/318/321 live perception certificate monitor. Disabled is an
+    /// explicit state; a configured monitor evaluates every accepted ESP32
+    /// CSI frame and retains its latest fail-closed policy decisions.
+    live_trust: live_trust::LiveTrustMonitor,
     /// SVD-based room field model for eigenvalue person counting (None until calibration).
     field_model: Option<FieldModel>,
     // ── ADR-044 §5.2: adaptive rolling-p95 normalization ─────────────────────
@@ -1428,7 +1451,18 @@ impl AppStateInner {
                 }
             }
         }
-        if self.source.starts_with("realtek") {
+        // ADR-323: "realtek_csi" (RTL8721Dx CSI) must be checked before the
+        // bare "realtek" (RTL8720F radar) prefix below, since
+        // "realtek_csi".starts_with("realtek") is also true — without this
+        // ordering the CSI source's freshness would be silently gated by the
+        // radar's (usually absent) last-frame timer, or vice versa.
+        if self.source.starts_with("realtek_csi") {
+            if let Some(last) = self.last_realtek_csi_frame {
+                if last.elapsed() > ESP32_OFFLINE_TIMEOUT {
+                    return format!("{}:offline", self.source);
+                }
+            }
+        } else if self.source.starts_with("realtek") {
             if let Some(last) = self.last_realtek_frame {
                 if last.elapsed() > ESP32_OFFLINE_TIMEOUT {
                     return format!("{}:offline", self.source);
@@ -1494,6 +1528,8 @@ impl AppStateInner {
             last_mediatek_frame: None,
             latest_qualcomm_csi: None,
             last_qualcomm_frame: None,
+            latest_realtek_csi: None,
+            last_realtek_csi_frame: None,
             latest_vendor_rf: BTreeMap::new(),
             tx: broadcast::channel::<String>(16).0,
             intro: wifi_densepose_sensing_server::introspection::IntrospectionState::new(),
@@ -1544,6 +1580,7 @@ impl AppStateInner {
                 "Default Room",
                 None,
             ),
+            live_trust: live_trust::LiveTrustMonitor::disabled(),
             field_model: None,
             p95_variance: RollingP95::new(600, 60),
             p95_motion_band_power: RollingP95::new(600, 60),
@@ -2945,6 +2982,13 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
             0
         };
 
+        s.live_trust.observe_transport(
+            authenticated_ingest::SourceKind::WindowsWifi,
+            Some(0),
+            u64::from(seq),
+            chrono::Utc::now().timestamp_millis(),
+            false,
+        );
         let mut update = SensingUpdate {
             msg_type: "sensing_update".to_string(),
             timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
@@ -2985,6 +3029,7 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
             },
             node_features: None,
             room_inference: None,
+            perception_trust: Some(s.live_trust.snapshot()),
         };
 
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
@@ -3107,6 +3152,13 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         0
     };
 
+    s.live_trust.observe_transport(
+        authenticated_ingest::SourceKind::WindowsWifi,
+        Some(0),
+        u64::from(seq),
+        chrono::Utc::now().timestamp_millis(),
+        false,
+    );
     let mut update = SensingUpdate {
         msg_type: "sensing_update".to_string(),
         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
@@ -3147,6 +3199,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         },
         node_features: None,
         room_inference: None,
+        perception_trust: Some(s.live_trust.snapshot()),
     };
 
     let raw_persons = derive_pose_from_sensing(&update);
@@ -3724,6 +3777,14 @@ async fn latest_qualcomm_csi(State(state): State<SharedState>) -> Json<serde_jso
     match &s.latest_qualcomm_csi {
         Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_default()),
         None => Json(serde_json::json!({"status": "no Qualcomm CSI data yet"})),
+    }
+}
+
+async fn latest_realtek_csi(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    match &s.latest_realtek_csi {
+        Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_default()),
+        None => Json(serde_json::json!({"status": "no Realtek RTL8721Dx CSI data yet"})),
     }
 }
 
@@ -4780,8 +4841,83 @@ async fn health_ready(State(state): State<SharedState>) -> Json<serde_json::Valu
             "recalibration_recommended": s.engine_bridge.recalibration_recommended(),
             "engine_error_count": s.engine_bridge.engine_error_count(),
             "raw_outputs_suppressed": s.engine_bridge.suppress_raw_outputs(),
+            "perception_certificate_spine": s.live_trust.snapshot(),
         },
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrustAuthorizationRequest {
+    action_class: ruview_policy::ActionClass,
+    actuator_id: String,
+    idempotency_key: String,
+}
+
+/// ADR-321/322 enforcement seam for lock, alarm, and automation adapters.
+/// This endpoint has no physical side effect: an adapter must obtain an allow
+/// immediately before dispatch. Unknown actions and stale/unevaluated room
+/// state deny. As an unlisted mutating route it is admin-scoped by the bearer
+/// middleware's fail-closed policy.
+async fn trust_authorize(
+    State(state): State<SharedState>,
+    Json(request): Json<TrustAuthorizationRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if request.actuator_id.is_empty()
+        || request.actuator_id.len() > 128
+        || request.idempotency_key.is_empty()
+        || request.idempotency_key.len() > 128
+        || request
+            .actuator_id
+            .chars()
+            .chain(request.idempotency_key.chars())
+            .any(char::is_control)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "allowed": false,
+                "reason": "invalid_request_boundary"
+            })),
+        );
+    }
+    let snapshot = state.read().await.live_trust.snapshot();
+    let decision = snapshot
+        .room_decisions
+        .iter()
+        .find(|decision| decision.action_class == request.action_class);
+    let (allowed, reason, authorization) = match decision {
+        Some(decision) if decision.authorization.is_allowed() => {
+            (true, None, Some(decision.authorization.clone()))
+        }
+        Some(decision) => (
+            false,
+            decision
+                .authorization
+                .failed_condition()
+                .map(|condition| condition.name()),
+            Some(decision.authorization.clone()),
+        ),
+        None => (false, Some("room_trust_not_evaluated"), None),
+    };
+    let status = if allowed {
+        StatusCode::OK
+    } else {
+        StatusCode::FORBIDDEN
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "allowed": allowed,
+            "reason": reason,
+            "action_class": request.action_class,
+            "actuator_id": request.actuator_id,
+            "idempotency_key": request.idempotency_key,
+            "authorization": authorization,
+            "evaluated_at_unix_ms": chrono::Utc::now().timestamp_millis(),
+            "permit_ttl_ms": if allowed { 1000 } else { 0 },
+        })),
+    )
 }
 
 async fn health_system(State(state): State<SharedState>) -> Json<serde_json::Value> {
@@ -5897,7 +6033,7 @@ async fn udp_receiver_task(
     let addr = format!("{bind_ip}:{udp_port}");
     let socket = match UdpSocket::bind(&addr).await {
         Ok(s) => {
-            info!("UDP listening on {addr} for ESP32, MediaTek, Qualcomm CSI, and RTL8720F radar frames");
+            info!("UDP listening on {addr} for ESP32, MediaTek, Qualcomm, Realtek RTL8721Dx CSI, and RTL8720F radar frames");
             s
         }
         Err(e) => {
@@ -5919,6 +6055,39 @@ async fn udp_receiver_task(
                     );
                     continue;
                 }
+                // ADR-322: authenticate the outer datagram before any vendor
+                // decoder sees it. An unsigned legacy packet remains usable
+                // for visualization but is marked unverified by the trust
+                // monitor; a malformed, forged, stale, or replayed envelope is
+                // dropped and can never downgrade to the legacy path.
+                let authenticated_datagram = {
+                    let mut s = state.write().await;
+                    match s.live_trust.verify_datagram(
+                        &buf[..len],
+                        chrono::Utc::now().timestamp_millis(),
+                    ) {
+                        Ok(value) => value,
+                        Err(authenticated_ingest::EnvelopeError::NotEnvelope) => None,
+                        Err(error) => {
+                            warn!(source = %src, "rejected authenticated sensor datagram: {error}");
+                            continue;
+                        }
+                    }
+                };
+                let len = if let Some(opened) = authenticated_datagram.as_ref() {
+                    if !authenticated_ingest::source_matches_payload(opened.source, &opened.payload) {
+                        warn!(source = %src, "authenticated source kind does not match inner sensor payload");
+                        continue;
+                    }
+                    if opened.payload.len() > buf.len() {
+                        warn!(source = %src, "authenticated sensor payload exceeds receive buffer");
+                        continue;
+                    }
+                    buf[..opened.payload.len()].copy_from_slice(&opened.payload);
+                    opened.payload.len()
+                } else {
+                    len
+                };
                 if len > 0 && buf[0] == b'{' {
                     match serde_json::from_slice::<wifi_densepose_hardware::vendor_rf::VendorRfEvent>(&buf[..len])
                         .map_err(|error| error.to_string())
@@ -5928,6 +6097,16 @@ async fn udp_receiver_task(
                             debug!("Vendor RF event from {src}: vendor={} capability={:?} seq={}", snapshot.event.vendor.as_str(), snapshot.event.capability, snapshot.event.sequence);
                             let json = serde_json::to_string(&snapshot).ok();
                             let mut state = state.write().await;
+                            let auth = authenticated_datagram.as_ref().filter(|opened| {
+                                opened.source == authenticated_ingest::SourceKind::VendorRf
+                            });
+                            state.live_trust.observe_transport(
+                                authenticated_ingest::SourceKind::VendorRf,
+                                auth.map(|opened| opened.node_id),
+                                snapshot.event.sequence,
+                                chrono::Utc::now().timestamp_millis(),
+                                auth.is_some(),
+                            );
                             state.source = snapshot.source.clone();
                             state.latest_vendor_rf.insert(snapshot.event.vendor.as_str().to_string(), snapshot);
                             if let Some(json) = json { let _ = state.tx.send(json); }
@@ -5947,6 +6126,16 @@ async fn udp_receiver_task(
                             debug!("Qualcomm CSI from {src}: profile={} seq={} dimensions={}x{}x{}", snapshot.chipset, snapshot.sequence, snapshot.tx_count, snapshot.rx_count, snapshot.subcarrier_count);
                             let json = serde_json::to_string(&snapshot).ok();
                             let mut s = state.write().await;
+                            let auth = authenticated_datagram.as_ref().filter(|opened| {
+                                opened.source == authenticated_ingest::SourceKind::Qualcomm
+                            });
+                            s.live_trust.observe_transport(
+                                authenticated_ingest::SourceKind::Qualcomm,
+                                auth.map(|opened| opened.node_id),
+                                u64::from(snapshot.sequence),
+                                chrono::Utc::now().timestamp_millis(),
+                                auth.is_some(),
+                            );
                             s.source = snapshot.source.to_string();
                             s.last_qualcomm_frame = Some(std::time::Instant::now());
                             s.latest_qualcomm_csi = Some(snapshot);
@@ -5967,6 +6156,16 @@ async fn udp_receiver_task(
                             debug!("MediaTek CSI from {src}: profile={} seq={} dimensions={}x{}x{}", snapshot.chipset, snapshot.sequence, snapshot.tx_count, snapshot.rx_count, snapshot.subcarrier_count);
                             let json = serde_json::to_string(&snapshot).ok();
                             let mut s = state.write().await;
+                            let auth = authenticated_datagram.as_ref().filter(|opened| {
+                                opened.source == authenticated_ingest::SourceKind::Mediatek
+                            });
+                            s.live_trust.observe_transport(
+                                authenticated_ingest::SourceKind::Mediatek,
+                                auth.map(|opened| opened.node_id),
+                                u64::from(snapshot.sequence),
+                                chrono::Utc::now().timestamp_millis(),
+                                auth.is_some(),
+                            );
                             s.source = snapshot.source.to_string();
                             s.last_mediatek_frame = Some(std::time::Instant::now());
                             s.latest_mediatek_csi = Some(snapshot);
@@ -5987,6 +6186,16 @@ async fn udp_receiver_task(
                             debug!("RTL8720F radar from {src}: type={} seq={} elements={}", snapshot.report_type, snapshot.sequence, snapshot.element_count);
                             let json = serde_json::to_string(&snapshot).ok();
                             let mut s = state.write().await;
+                            let auth = authenticated_datagram.as_ref().filter(|opened| {
+                                opened.source == authenticated_ingest::SourceKind::Realtek
+                            });
+                            s.live_trust.observe_transport(
+                                authenticated_ingest::SourceKind::Realtek,
+                                auth.map(|opened| opened.node_id),
+                                u64::from(snapshot.sequence),
+                                chrono::Utc::now().timestamp_millis(),
+                                auth.is_some(),
+                            );
                             s.source = snapshot.source.to_string();
                             s.last_realtek_frame = Some(std::time::Instant::now());
                             s.latest_realtek_radar = Some(snapshot);
@@ -5996,6 +6205,38 @@ async fn udp_receiver_task(
                         }
                         Ok((_, consumed)) => warn!("RTL8720F radar datagram from {src} has trailing bytes: consumed={consumed} received={len}"),
                         Err(error) => warn!("Rejected RTL8720F radar datagram from {src}: {error}"),
+                    }
+                    continue;
+                }
+                if len >= 4
+                    && u32::from_le_bytes(buf[..4].try_into().expect("four-byte slice"))
+                        == wifi_densepose_hardware::realtek_csi::RAC1_MAGIC
+                {
+                    match wifi_densepose_hardware::realtek_csi::CsiFrame::from_bytes(&buf[..len]) {
+                        Ok((frame, consumed)) if consumed == len => {
+                            let snapshot = realtek_csi::RealtekCsiSnapshot::from_frame(&frame);
+                            debug!("Realtek RTL8721Dx CSI from {src}: mode={} seq={} subcarriers={}", snapshot.csi_mode, snapshot.sequence, snapshot.num_sub_carrier);
+                            let json = serde_json::to_string(&snapshot).ok();
+                            let mut s = state.write().await;
+                            let auth = authenticated_datagram.as_ref().filter(|opened| {
+                                opened.source == authenticated_ingest::SourceKind::RealtekCsi
+                            });
+                            s.live_trust.observe_transport(
+                                authenticated_ingest::SourceKind::RealtekCsi,
+                                auth.map(|opened| opened.node_id),
+                                u64::from(snapshot.sequence),
+                                chrono::Utc::now().timestamp_millis(),
+                                auth.is_some(),
+                            );
+                            s.source = snapshot.source.to_string();
+                            s.last_realtek_csi_frame = Some(std::time::Instant::now());
+                            s.latest_realtek_csi = Some(snapshot);
+                            if let Some(json) = json {
+                                let _ = s.tx.send(json);
+                            }
+                        }
+                        Ok((_, consumed)) => warn!("Realtek RTL8721Dx CSI datagram from {src} has trailing bytes: consumed={consumed} received={len}"),
+                        Err(error) => warn!("Rejected Realtek RTL8721Dx CSI datagram from {src}: {error}"),
                     }
                     continue;
                 }
@@ -6241,6 +6482,7 @@ async fn udp_receiver_task(
                         // tripping back to the server.
                         node_features: build_node_features(&s.node_states, now),
                         room_inference: Some(room_inference),
+                        perception_trust: None,
                     };
 
                     let raw_persons = derive_pose_from_sensing(&update);
@@ -6524,6 +6766,30 @@ async fn udp_receiver_task(
                     // state from all nodes (the borrow of `ns` ends here).
                     // (We re-borrow node_states immutably via `s` below.)
 
+                    // ADR-300 perception certificate spine: automatically
+                    // evaluate the real frame against the signed calibration,
+                    // feed the OOD state into capability validation, then run
+                    // every action policy. This is independent of the older
+                    // ADR-135 privacy/provenance engine below; both results are
+                    // surfaced, and neither silently upgrades the other.
+                    let trust_now_ms = chrono::Utc::now().timestamp_millis();
+                    s.live_trust.observe(live_trust::LiveObservation {
+                        node_id,
+                        sequence: frame.sequence,
+                        timestamp_unix_ms: trust_now_ms,
+                        amplitudes: &frame.amplitudes,
+                        temporal_variance: features.variance,
+                        presence: classification.presence,
+                        confidence: classification.confidence,
+                        rssi_dbm: frame.rssi as f64,
+                        noise_floor_dbm: frame.noise_floor as f64,
+                        authenticated: authenticated_datagram.as_ref().is_some_and(|opened| {
+                            opened.source == authenticated_ingest::SourceKind::Esp32
+                                && opened.node_id == frame.node_id
+                                && opened.sequence == u64::from(frame.sequence)
+                        }),
+                    });
+
                     s.rssi_history.push_back(features.mean_rssi);
                     if s.rssi_history.len() > 60 {
                         s.rssi_history.pop_front();
@@ -6693,6 +6959,10 @@ async fn udp_receiver_task(
                         // tripping back to the server.
                         node_features: build_node_features(&s.node_states, now),
                         room_inference: Some(room_inference),
+                        perception_trust: {
+                            let snapshot = s.live_trust.snapshot();
+                            snapshot.enabled.then_some(snapshot)
+                        },
                     };
 
                     let raw_persons = derive_pose_from_sensing(&update);
@@ -6952,6 +7222,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
             },
             node_features: None,
             room_inference: None,
+            perception_trust: None,
         };
 
         // Populate persons from the sensing update (Kalman-smoothed via tracker).
@@ -8188,6 +8459,27 @@ async fn main() {
     let field_surface: rufield_surface::FieldState =
         Arc::new(RwLock::new(rufield_surface::FieldSurface::from_env()));
 
+    // ADR-300/318/321: explicit configuration activates the automatic live
+    // perception trust chain. An operator who supplied a config must never get
+    // a quietly-disabled server when it is malformed or its verifier material
+    // is absent, so this is a boot refusal rather than a warning + fallback.
+    let live_trust = match args.trust_config.as_deref() {
+        Some(path) => match live_trust::LiveTrustMonitor::from_path(path) {
+            Ok(monitor) => {
+                info!(config = %path.display(), "live perception trust chain enabled");
+                monitor
+            }
+            Err(e) => {
+                error!(config = %path.display(), "live perception trust configuration rejected: {e}");
+                return;
+            }
+        },
+        None => {
+            info!("live perception trust chain disabled (set --trust-config to enable)");
+            live_trust::LiveTrustMonitor::disabled()
+        }
+    };
+
     // Populated inside the `multistatic_fuser` field initializer below, then
     // threaded into `engine_bridge` so both fusion paths honor the same
     // WDP_TDM_SLOTS/WDP_GUARD_INTERVAL_US-derived guard (#1049/#1057).
@@ -8206,6 +8498,8 @@ async fn main() {
         last_mediatek_frame: None,
         latest_qualcomm_csi: None,
         last_qualcomm_frame: None,
+        latest_realtek_csi: None,
+        last_realtek_csi_frame: None,
         latest_vendor_rf: BTreeMap::new(),
         tx,
         intro: wifi_densepose_sensing_server::introspection::IntrospectionState::new(),
@@ -8299,6 +8593,7 @@ async fn main() {
             "Default Room",
             engine_bridge_multistatic_cfg,
         ),
+        live_trust,
         field_model: if args.calibrate {
             info!("Field model calibration enabled — room should be empty during startup");
             FieldModel::new(field_bridge::single_link_config()).ok()
@@ -8497,12 +8792,14 @@ async fn main() {
         // API info
         .route("/api/v1/info", get(api_info))
         .route("/api/v1/status", get(health_ready))
+        .route("/api/v1/trust/authorize", post(trust_authorize))
         .route("/api/v1/metrics", get(health_metrics))
         // Sensing endpoints
         .route("/api/v1/sensing/latest", get(latest))
         .route("/api/v1/radar/latest", get(latest_realtek_radar))
         .route("/api/v1/csi/mediatek/latest", get(latest_mediatek_csi))
         .route("/api/v1/csi/qualcomm/latest", get(latest_qualcomm_csi))
+        .route("/api/v1/csi/realtek/latest", get(latest_realtek_csi))
         .route("/api/v1/rf/vendors", get(vendor_descriptors))
         .route("/api/v1/rf/vendors/latest", get(latest_vendor_events))
         .route("/api/v1/rf/vendors/:vendor/latest", get(latest_vendor_event))
@@ -9526,6 +9823,7 @@ mod observatory_persons_field_position_tests {
             estimated_persons: Some(1),
             node_features: None,
             room_inference: None,
+            perception_trust: None,
         }
     }
 
