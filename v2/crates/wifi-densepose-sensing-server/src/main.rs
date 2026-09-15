@@ -2113,8 +2113,10 @@ impl AppStateInner {
         amplitudes: &[f64],
         observed_at: std::time::Instant,
     ) -> bool {
-        // The field model remains single-link, but every radio in the room
-        // binding may contribute bounded observations on the frozen grid.
+        // Every bound radio is admitted this far: `calibration_source_nodes_missing`
+        // requires each one to prove it is present and delivering CSI on the
+        // frozen grid before a capture may finalize. Only writing the baseline
+        // is restricted, below.
         let binding_matches = self
             .calibration_grid_binding
             .is_some_and(|binding| binding.grid == grid);
@@ -2157,12 +2159,33 @@ impl AppStateInner {
             }
             CalibrationSequenceOrder::First | CalibrationSequenceOrder::Forward => {}
         }
+        // The field model is single-link: one baseline, one set of amplitude
+        // offsets. Averaging a second radio's offsets into it flattens the
+        // eigenstructure and leaves only a scalar energy threshold behind.
+        // Measured on three ESP32-C6 nodes: a four-node binding finalized with
+        // baseline_eigenvalue_count 0 and reported an occupant in an empty
+        // room, where the same room on the bound radio alone finalized with 5
+        // and reported absent.
+        //
+        // So only the grid-bound radio writes the baseline. The others still
+        // count as contributors -- they are present on the frozen grid, which
+        // is exactly what the finalize precondition asks -- they simply do not
+        // author the model. This mirrors the narrowing `bootstrap_baseline::store`
+        // already applies when it persists `vec![binding.source_node_id]` as the
+        // frozen model source.
+        let writes_baseline = self
+            .calibration_grid_binding
+            .is_some_and(|binding| binding.source_node_id == node_id);
         let accepted = self.field_model.as_mut().is_some_and(|field| {
             if matches!(
                 field.status(),
                 CalibrationStatus::Uncalibrated | CalibrationStatus::Collecting
             ) {
-                field_bridge::maybe_feed_calibration(field, amplitudes)
+                if writes_baseline {
+                    field_bridge::maybe_feed_calibration(field, amplitudes)
+                } else {
+                    true
+                }
             } else {
                 field.check_freshness(
                     (chrono::Utc::now().timestamp_millis().max(0) as u64)
@@ -2261,9 +2284,13 @@ impl AppStateInner {
     /// the active calibration (or a restored bootstrap image) bound exactly
     /// one. `None` means no single node owns the baseline.
     fn bound_source_node_id(&self) -> Option<u8> {
-        (self.calibration_source_node_ids.len() == 1)
-            .then(|| self.calibration_source_node_ids.iter().next().copied())
-            .flatten()
+        // The grid binding names the one radio that fed the single-link
+        // baseline, whatever the size of the room's node set. Scoring any
+        // other radio against that baseline is the documented false-occupancy
+        // case, so prefer the bound source and never fall back to the shared
+        // mixed-radio history while a binding exists.
+        self.calibration_grid_binding
+            .map(|binding| binding.source_node_id)
             .or_else(|| {
                 self.bootstrap_baseline.as_ref().and_then(|metadata| {
                     (metadata.source_node_ids.len() == 1)
@@ -7230,6 +7257,71 @@ mod bootstrap_vital_publication_tests {
         assert_eq!(status["observed_source_node_ids"], serde_json::json!([]));
         assert_eq!(status["missing_source_node_ids"], serde_json::json!([]));
     }
+
+    /// A room may bind several radios for identity, but the single-link field
+    /// model has one baseline and one set of amplitude offsets. Only the node
+    /// the grid was bound to may write it; the others stay in the receipt and
+    /// keep their tracking. Measured consequence of the old behaviour: a
+    /// four-node binding finalized with baseline_eigenvalue_count 0 and
+    /// reported an occupant in an empty room.
+    /// A room may bind several radios for identity, but the single-link field
+    /// model has one baseline and one set of amplitude offsets, so only the
+    /// grid-bound radio may author it. The others must still register as
+    /// contributors: `calibration_source_nodes_missing` refuses to finalize a
+    /// capture until every bound node has proven it is live on the frozen
+    /// grid. Gating them out of the feed path entirely deadlocks the capture
+    /// -- measured on hardware: 43,120 frames over 51 minutes stuck in
+    /// `collecting` with missing_source_node_ids=[12,13,14].
+    #[test]
+    fn multi_node_binding_contributes_but_only_the_bound_node_writes_the_baseline() {
+        let mut state = AppStateInner::minimal();
+        state.field_model = Some(
+            FieldModel::new(field_bridge::single_link_config()).expect("field model"),
+        );
+        bind_test_calibration(&mut state);
+        for node_id in [7_u8, 11, 13] {
+            state.calibration_source_node_ids.insert(node_id);
+            state.node_states.entry(node_id).or_insert_with(NodeState::new);
+        }
+        assert_eq!(
+            state.calibration_grid_binding.expect("binding").source_node_id,
+            5
+        );
+
+        // Every bound radio is admitted on the frozen grid.
+        for node_id in [5_u8, 7, 11, 13] {
+            assert!(
+                feed_test_frame(&mut state, node_id, 1, &[0.25; 64]),
+                "node {node_id} must register as a contributor"
+            );
+        }
+
+        // ...so the finalize precondition is satisfiable: nothing is missing.
+        let missing: Vec<u8> = state
+            .calibration_source_node_ids
+            .difference(&state.calibration_observed_source_node_ids)
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "a multi-node binding must still be able to finalize, missing={missing:?}"
+        );
+
+        // But only the bound radio authored the baseline.
+        assert_eq!(
+            state
+                .field_model
+                .as_ref()
+                .expect("field model")
+                .calibration_frame_count(),
+            1,
+            "exactly one radio may write the single-link baseline"
+        );
+
+        // And scoring follows that same radio.
+        assert_eq!(state.bound_source_node_id(), Some(5));
+    }
+
 
     #[test]
     fn non_bound_grid_never_enters_field_model_history() {
