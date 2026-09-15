@@ -1496,11 +1496,26 @@ impl NodeState {
                     && evidence.max_gap_s < CALIBRATION_GRID_MAX_GAP_S
                     && evidence.latest_age_s < CALIBRATION_GRID_MAX_GAP_S
             })
+            // Density first, to agree with `accept_grid`. That gate locks each
+            // node onto the densest grid it has seen and rejects sparser
+            // frames from the feature path -- on an ESP32-C6 the ~16% HT
+            // 64-bin minority alongside HE-SU 256-bin. Ordering selection by
+            // gap first picked exactly that minority: it is sparse, so its
+            // arrivals look smooth, while the grid the node actually keeps
+            // using scores worse on gap.
+            //
+            // Measured: a capture bound 64sc on node 11, every node then
+            // locked onto 256sc, the bound grid went stale with no frame for
+            // five minutes, frame_count froze at 10,997 and the capture could
+            // never finalize -- `collecting` forever with no error surfaced.
+            // A wider grid that the node will keep emitting beats a narrower
+            // one that admission is designed to discard.
             .min_by(|(left_grid, left), (right_grid, right)| {
-                left.max_gap_s
-                    .total_cmp(&right.max_gap_s)
+                right_grid
+                    .n_subcarriers
+                    .cmp(&left_grid.n_subcarriers)
+                    .then_with(|| left.max_gap_s.total_cmp(&right.max_gap_s))
                     .then_with(|| right.rate_hz.total_cmp(&left.rate_hz))
-                    .then_with(|| right_grid.n_subcarriers.cmp(&left_grid.n_subcarriers))
                     .then_with(|| left_grid.ppdu_type.cmp(&right_grid.ppdu_type))
             })
     }
@@ -7322,6 +7337,74 @@ mod bootstrap_vital_publication_tests {
         assert_eq!(state.bound_source_node_id(), Some(5));
     }
 
+
+    /// `accept_grid` locks a node onto the densest grid it has seen and
+    /// rejects sparser frames from the feature path -- on an ESP32-C6 the ~16%
+    /// HT 64-bin minority alongside HE-SU 256-bin. Selection must agree, or it
+    /// binds a grid the node is about to stop emitting. Measured consequence:
+    /// a capture bound 64sc, every node locked onto 256sc, the bound grid went
+    /// stale and the capture hung in `collecting` with frame_count frozen.
+    #[test]
+    fn calibration_grid_selection_prefers_the_grid_the_node_keeps_emitting() {
+        let mut node = NodeState::new();
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        let dense = CsiGridKey { n_subcarriers: 256, ppdu_type: 0 };
+        let sparse = CsiGridKey { n_subcarriers: 64, ppdu_type: 0 };
+
+        // The sparse minority trickles in on a perfectly regular cadence, so
+        // its worst-case gap is SMALLER than the dense grid's. The dense grid
+        // is what the radio actually streams, but a single scheduling hiccup
+        // gives it the larger gap. Gap-first ordering therefore picks the
+        // sparse grid -- the one `accept_grid` discards.
+        for i in 0..200_u32 {
+            node.observe_raw_grid(
+                dense,
+                start + std::time::Duration::from_millis(u64::from(i) * 50),
+            );
+        }
+        // one hiccup on the dense stream: a 2 s gap, then it resumes
+        for i in 0..100_u32 {
+            node.observe_raw_grid(
+                dense,
+                start
+                    + std::time::Duration::from_millis(12_000 + u64::from(i) * 50),
+            );
+        }
+        // sparse minority: metronomic 400 ms, never a gap worse than that
+        for i in 0..50_u32 {
+            node.observe_raw_grid(
+                sparse,
+                start + std::time::Duration::from_millis(u64::from(i) * 400),
+            );
+        }
+        node.observe_raw_grid(dense, std::time::Instant::now());
+        node.observe_raw_grid(sparse, std::time::Instant::now());
+
+        // Precondition: the sparse grid really does look smoother, so this
+        // test fails against gap-first ordering rather than passing by luck.
+        let candidates = node.calibration_grid_candidates(std::time::Instant::now());
+        let gap_of = |want: CsiGridKey| {
+            candidates
+                .iter()
+                .find(|(g, _)| *g == want)
+                .map(|(_, e)| e.max_gap_s)
+                .expect("candidate present")
+        };
+        assert!(
+            gap_of(sparse) < gap_of(dense),
+            "test data must make the sparse grid look smoother: sparse={} dense={}",
+            gap_of(sparse),
+            gap_of(dense)
+        );
+
+        let (grid, _) = node
+            .select_calibration_grid(std::time::Instant::now())
+            .expect("a qualifying grid");
+        assert_eq!(
+            grid.n_subcarriers, 256,
+            "selection must bind the grid the node keeps emitting, not the sparse minority admission rejects"
+        );
+    }
 
     #[test]
     fn non_bound_grid_never_enters_field_model_history() {
