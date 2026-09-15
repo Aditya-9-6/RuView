@@ -19,6 +19,7 @@ mod model_format;
 mod multistatic_bridge;
 mod mediatek_csi;
 mod qualcomm_csi;
+mod realtek_csi;
 mod realtek_radar;
 mod path_safety;
 pub mod pose;
@@ -1768,6 +1769,10 @@ struct AppStateInner {
     latest_qualcomm_csi: Option<qualcomm_csi::QualcommCsiSnapshot>,
     /// Instant of the last validated Qualcomm CSI UDP frame.
     last_qualcomm_frame: Option<std::time::Instant>,
+    /// Latest validated RTL8721Dx CSI summary; distinct from RTL8720F radar.
+    latest_realtek_csi: Option<realtek_csi::RealtekCsiSnapshot>,
+    /// Instant of the last validated RTL8721Dx CSI UDP frame.
+    last_realtek_csi_frame: Option<std::time::Instant>,
     /// Latest bounded ADR-270 event per vendor. Complex CSI uses dedicated transports.
     latest_vendor_rf: BTreeMap<String, wifi_densepose_sensing_server::vendor_rf::VendorEventSnapshot>,
     tx: broadcast::Sender<String>,
@@ -2312,7 +2317,13 @@ impl AppStateInner {
                 }
             }
         }
-        if self.source.starts_with("realtek") {
+        if self.source.starts_with("realtek_csi") {
+            if let Some(last) = self.last_realtek_csi_frame {
+                if last.elapsed() > ESP32_OFFLINE_TIMEOUT {
+                    return format!("{}:offline", self.source);
+                }
+            }
+        } else if self.source.starts_with("realtek") {
             if let Some(last) = self.last_realtek_frame {
                 if last.elapsed() > ESP32_OFFLINE_TIMEOUT {
                     return format!("{}:offline", self.source);
@@ -2382,6 +2393,8 @@ impl AppStateInner {
             last_mediatek_frame: None,
             latest_qualcomm_csi: None,
             last_qualcomm_frame: None,
+            latest_realtek_csi: None,
+            last_realtek_csi_frame: None,
             latest_vendor_rf: BTreeMap::new(),
             tx: broadcast::channel::<String>(16).0,
             intro: wifi_densepose_sensing_server::introspection::IntrospectionState::new(),
@@ -4866,6 +4879,53 @@ async fn latest_qualcomm_csi(State(state): State<SharedState>) -> Json<serde_jso
     match &s.latest_qualcomm_csi {
         Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_default()),
         None => Json(serde_json::json!({"status": "no Qualcomm CSI data yet"})),
+    }
+}
+
+async fn latest_realtek_csi(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    let s = state.read().await;
+    match &s.latest_realtek_csi {
+        Some(snapshot) => Json(serde_json::to_value(snapshot).unwrap_or_default()),
+        None => Json(serde_json::json!({"status": "no Realtek RTL8721Dx CSI data yet"})),
+    }
+}
+
+fn primary_source_with_realtek(
+    last_esp32_frame: Option<std::time::Instant>,
+    realtek_source: &str,
+) -> String {
+    if last_esp32_frame.is_some_and(|seen| seen.elapsed() < ESP32_OFFLINE_TIMEOUT) {
+        "esp32".to_string()
+    } else {
+        realtek_source.to_string()
+    }
+}
+
+#[cfg(test)]
+mod realtek_ingest_tests {
+    use super::*;
+    use wifi_densepose_hardware::realtek_csi::simulator::{RealtekCsiSimulator, SimulatorConfig};
+
+    #[test]
+    fn secondary_realtek_does_not_displace_fresh_esp32_room_source() {
+        assert_eq!(
+            primary_source_with_realtek(Some(std::time::Instant::now()), "realtek_csi"),
+            "esp32"
+        );
+        assert_eq!(primary_source_with_realtek(None, "realtek_csi"), "realtek_csi");
+    }
+
+    #[tokio::test]
+    async fn latest_route_keeps_synthetic_provenance_and_node_identity() {
+        let state: SharedState = Arc::new(RwLock::new(AppStateInner::minimal()));
+        let mut simulator = RealtekCsiSimulator::new(SimulatorConfig::default()).unwrap();
+        let snapshot = realtek_csi::RealtekCsiSnapshot::from_frame(&simulator.next_frame());
+        let expected_node_id = snapshot.node_id;
+        state.write().await.latest_realtek_csi = Some(snapshot);
+        let Json(value) = latest_realtek_csi(State(state)).await;
+        assert_eq!(value["node_id"], expected_node_id);
+        assert_eq!(value["source"], "realtek_csi:simulated");
+        assert_eq!(value["synthetic"], true);
     }
 }
 
@@ -8826,7 +8886,7 @@ async fn udp_receiver_task(
     let addr = format!("{bind_ip}:{udp_port}");
     let socket = match UdpSocket::bind(&addr).await {
         Ok(s) => {
-            info!("UDP listening on {addr} for ESP32, MediaTek, Qualcomm CSI, and RTL8720F radar frames");
+            info!("UDP listening on {addr} for ESP32, MediaTek, Qualcomm, RTL8721Dx CSI, and RTL8720F radar frames");
             s
         }
         Err(e) => {
@@ -8925,6 +8985,33 @@ async fn udp_receiver_task(
                         }
                         Ok((_, consumed)) => warn!("RTL8720F radar datagram from {src} has trailing bytes: consumed={consumed} received={len}"),
                         Err(error) => warn!("Rejected RTL8720F radar datagram from {src}: {error}"),
+                    }
+                    continue;
+                }
+                if len >= 4
+                    && u32::from_le_bytes(buf[..4].try_into().expect("four-byte slice"))
+                        == wifi_densepose_hardware::realtek_csi::RAC1_MAGIC
+                {
+                    match wifi_densepose_hardware::realtek_csi::CsiFrame::from_bytes(&buf[..len]) {
+                        Ok((frame, consumed)) if consumed == len => {
+                            let snapshot = realtek_csi::RealtekCsiSnapshot::from_frame(&frame);
+                            debug!("RTL8721Dx CSI from {src}: node={} seq={} subcarriers={}", snapshot.node_id, snapshot.sequence, snapshot.num_sub_carrier);
+                            let json = serde_json::to_string(&snapshot).ok();
+                            let mut s = state.write().await;
+                            // A secondary Realtek link must not replace a fresh ESP32
+                            // room source and make its vitals disappear from the UI.
+                            s.source = primary_source_with_realtek(
+                                s.last_esp32_frame,
+                                snapshot.source,
+                            );
+                            s.last_realtek_csi_frame = Some(std::time::Instant::now());
+                            s.latest_realtek_csi = Some(snapshot);
+                            if let Some(json) = json {
+                                let _ = s.tx.send(json);
+                            }
+                        }
+                        Ok((_, consumed)) => warn!("RTL8721Dx CSI datagram from {src} has trailing bytes: consumed={consumed} received={len}"),
+                        Err(error) => warn!("Rejected RTL8721Dx CSI datagram from {src}: {error}"),
                     }
                     continue;
                 }
@@ -11271,6 +11358,8 @@ async fn main() {
         last_mediatek_frame: None,
         latest_qualcomm_csi: None,
         last_qualcomm_frame: None,
+        latest_realtek_csi: None,
+        last_realtek_csi_frame: None,
         latest_vendor_rf: BTreeMap::new(),
         tx,
         intro: wifi_densepose_sensing_server::introspection::IntrospectionState::new(),
@@ -11616,6 +11705,7 @@ async fn main() {
         .route("/api/v1/radar/latest", get(latest_realtek_radar))
         .route("/api/v1/csi/mediatek/latest", get(latest_mediatek_csi))
         .route("/api/v1/csi/qualcomm/latest", get(latest_qualcomm_csi))
+        .route("/api/v1/csi/realtek/latest", get(latest_realtek_csi))
         .route("/api/v1/rf/vendors", get(vendor_descriptors))
         .route("/api/v1/rf/vendors/latest", get(latest_vendor_events))
         .route("/api/v1/rf/vendors/:vendor/latest", get(latest_vendor_event))
