@@ -384,6 +384,41 @@ struct CalibrationGridBinding {
     evidence: Option<CalibrationGridEvidence>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CalibrationModelReceipt {
+    schema: &'static str,
+    boot_epoch: String,
+    session_id: String,
+    model_id: String,
+    binding_digest: String,
+    source_node_ids: Vec<u8>,
+    frame_count: u64,
+    variance_explained: f64,
+    baseline_eigenvalue_count: usize,
+    completed_at_unix_ms: u64,
+}
+
+/// Per-frame occupancy result bound to one immutable field-model calibration
+/// receipt. Absent whenever the model is stale, unavailable, or cannot score
+/// the current observation without a heuristic fallback, so a consumer can
+/// never mistake a fallback for calibrated evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CalibratedPresenceEvidence {
+    schema: String,
+    boot_epoch: String,
+    session_id: String,
+    model_id: String,
+    binding_digest: String,
+    source_node_ids: Vec<u8>,
+    model_completed_at_unix_ms: u64,
+    inference_node_id: u8,
+    source_tick: u64,
+    observed_at_unix_ms: u64,
+    inference_method: String,
+    presence: bool,
+    person_count: usize,
+}
+
 /// Sensing update broadcast to WebSocket clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SensingUpdate {
@@ -399,6 +434,10 @@ struct SensingUpdate {
     /// Vital sign estimates (breathing rate, heart rate, confidence).
     #[serde(skip_serializing_if = "Option::is_none")]
     vital_signs: Option<VitalSigns>,
+    /// Strict calibrated occupancy evidence for this frame, bound to the
+    /// active model receipt. Omitted when no calibrated result is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    calibrated_presence_evidence: Option<CalibratedPresenceEvidence>,
     // ── ADR-022 Phase 3: Enhanced multi-BSSID pipeline fields ──
     /// Enhanced motion estimate from multi-BSSID pipeline.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1455,11 +1494,26 @@ impl NodeState {
                     && evidence.max_gap_s < CALIBRATION_GRID_MAX_GAP_S
                     && evidence.latest_age_s < CALIBRATION_GRID_MAX_GAP_S
             })
+            // Density first, to agree with `accept_grid`. That gate locks each
+            // node onto the densest grid it has seen and rejects sparser
+            // frames from the feature path -- on an ESP32-C6 the ~16% HT
+            // 64-bin minority alongside HE-SU 256-bin. Ordering selection by
+            // gap first picked exactly that minority: it is sparse, so its
+            // arrivals look smooth, while the grid the node actually keeps
+            // using scores worse on gap.
+            //
+            // Measured: a capture bound 64sc on node 11, every node then
+            // locked onto 256sc, the bound grid went stale with no frame for
+            // five minutes, frame_count froze at 10,997 and the capture could
+            // never finalize -- `collecting` forever with no error surfaced.
+            // A wider grid that the node will keep emitting beats a narrower
+            // one that admission is designed to discard.
             .min_by(|(left_grid, left), (right_grid, right)| {
-                left.max_gap_s
-                    .total_cmp(&right.max_gap_s)
+                right_grid
+                    .n_subcarriers
+                    .cmp(&left_grid.n_subcarriers)
+                    .then_with(|| left.max_gap_s.total_cmp(&right.max_gap_s))
                     .then_with(|| right.rate_hz.total_cmp(&left.rate_hz))
-                    .then_with(|| right_grid.n_subcarriers.cmp(&left_grid.n_subcarriers))
                     .then_with(|| left_grid.ppdu_type.cmp(&right_grid.ppdu_type))
             })
     }
@@ -1903,8 +1957,16 @@ struct AppStateInner {
     bootstrap_baseline_active: bool,
     /// Server generated identity for the current explicit calibration model.
     calibration_model_id: Option<String>,
-    /// Nodes that actually contributed frames to the current calibration.
+    /// Process and current explicit room-calibration identities.
+    calibration_boot_epoch: String,
+    calibration_session_id: Option<String>,
+    calibration_binding_digest: Option<String>,
+    /// Exact sorted node set authorized by the current room binding.
     calibration_source_node_ids: std::collections::BTreeSet<u8>,
+    /// Authorized nodes that actually contributed raw CSI to this session.
+    calibration_observed_source_node_ids: std::collections::BTreeSet<u8>,
+    /// Immutable evidence created when the active model is finalized.
+    calibration_model_receipt: Option<CalibrationModelReceipt>,
     /// Immutable source and CSI symbol grid selected from recent header-only
     /// evidence for the current field model.
     calibration_grid_binding: Option<CalibrationGridBinding>,
@@ -2068,9 +2130,13 @@ impl AppStateInner {
         amplitudes: &[f64],
         observed_at: std::time::Instant,
     ) -> bool {
-        let binding_matches = self.calibration_grid_binding.is_some_and(|binding| {
-            binding.source_node_id == node_id && binding.grid == grid
-        });
+        // Every bound radio is admitted this far: `calibration_source_nodes_missing`
+        // requires each one to prove it is present and delivering CSI on the
+        // frozen grid before a capture may finalize. Only writing the baseline
+        // is restricted, below.
+        let binding_matches = self
+            .calibration_grid_binding
+            .is_some_and(|binding| binding.grid == grid);
         if !binding_matches
             || !calibration_source_accepts(&self.calibration_source_node_ids, node_id)
             || self.calibration_sequence_fault_node_ids.contains(&node_id)
@@ -2110,12 +2176,33 @@ impl AppStateInner {
             }
             CalibrationSequenceOrder::First | CalibrationSequenceOrder::Forward => {}
         }
+        // The field model is single-link: one baseline, one set of amplitude
+        // offsets. Averaging a second radio's offsets into it flattens the
+        // eigenstructure and leaves only a scalar energy threshold behind.
+        // Measured on three ESP32-C6 nodes: a four-node binding finalized with
+        // baseline_eigenvalue_count 0 and reported an occupant in an empty
+        // room, where the same room on the bound radio alone finalized with 5
+        // and reported absent.
+        //
+        // So only the grid-bound radio writes the baseline. The others still
+        // count as contributors -- they are present on the frozen grid, which
+        // is exactly what the finalize precondition asks -- they simply do not
+        // author the model. This mirrors the narrowing `bootstrap_baseline::store`
+        // already applies when it persists `vec![binding.source_node_id]` as the
+        // frozen model source.
+        let writes_baseline = self
+            .calibration_grid_binding
+            .is_some_and(|binding| binding.source_node_id == node_id);
         let accepted = self.field_model.as_mut().is_some_and(|field| {
             if matches!(
                 field.status(),
                 CalibrationStatus::Uncalibrated | CalibrationStatus::Collecting
             ) {
-                field_bridge::maybe_feed_calibration(field, amplitudes)
+                if writes_baseline {
+                    field_bridge::maybe_feed_calibration(field, amplitudes)
+                } else {
+                    true
+                }
             } else {
                 field.check_freshness(
                     (chrono::Utc::now().timestamp_millis().max(0) as u64)
@@ -2124,7 +2211,7 @@ impl AppStateInner {
             }
         });
         if accepted {
-            self.calibration_source_node_ids.insert(node_id);
+            self.calibration_observed_source_node_ids.insert(node_id);
             self.calibration_last_sequences.insert(node_id, sequence);
             if let Some(node) = self.node_states.get_mut(&node_id) {
                 node.push_field_model_frame(sequence, amplitudes, observed_at);
@@ -2210,6 +2297,82 @@ impl AppStateInner {
     /// "esp32:offline" so the UI can distinguish active vs stale connections.
     /// Person count: eigenvalue-based if field model is calibrated, else heuristic.
     /// Uses global frame_history if populated, otherwise the freshest per-node history.
+    /// The single source node a single-link model is allowed to score, when
+    /// the active calibration (or a restored bootstrap image) bound exactly
+    /// one. `None` means no single node owns the baseline.
+    fn bound_source_node_id(&self) -> Option<u8> {
+        // The grid binding names the one radio that fed the single-link
+        // baseline, whatever the size of the room's node set. Scoring any
+        // other radio against that baseline is the documented false-occupancy
+        // case, so prefer the bound source and never fall back to the shared
+        // mixed-radio history while a binding exists.
+        self.calibration_grid_binding
+            .map(|binding| binding.source_node_id)
+            .or_else(|| {
+                self.bootstrap_baseline.as_ref().and_then(|metadata| {
+                    (metadata.source_node_ids.len() == 1)
+                        .then_some(metadata.source_node_ids[0])
+                })
+            })
+    }
+
+    /// Frame history the field model scores. Shared by `person_count_at` and
+    /// the calibrated presence evidence so the published evidence can never
+    /// disagree with the count derived from the same model.
+    fn scoring_history(&self) -> &VecDeque<Vec<f64>> {
+        if let Some(node_id) = self.bound_source_node_id() {
+            self.node_states
+                .get(&node_id)
+                .map(|state| &state.field_model_history)
+                .unwrap_or(&self.frame_history)
+        } else if !self.frame_history.is_empty() {
+            &self.frame_history
+        } else {
+            self.node_states
+                .values()
+                .filter(|ns| !ns.frame_history.is_empty())
+                .max_by_key(|ns| ns.last_frame_time)
+                .map(|ns| &ns.frame_history)
+                .unwrap_or(&self.frame_history)
+        }
+    }
+
+    /// Strict per-frame calibrated occupancy evidence bound to the active
+    /// model receipt. Returns `None` unless an explicit calibration is fresh
+    /// and the field model scores the observation without falling back to the
+    /// heuristic, so a consumer may treat a present value as calibrated.
+    fn calibrated_presence_evidence(
+        &self,
+        inference_node_id: u8,
+        source_tick: u64,
+        observed_at_unix_ms: u64,
+    ) -> Option<CalibratedPresenceEvidence> {
+        if !self.explicit_calibration_fresh_at(observed_at_unix_ms) {
+            return None;
+        }
+        let receipt = self.calibration_model_receipt.as_ref()?;
+        let occupancy = field_bridge::calibrated_occupancy(
+            self.field_model.as_ref()?,
+            self.scoring_history(),
+            observed_at_unix_ms.saturating_mul(1_000),
+        )?;
+        Some(CalibratedPresenceEvidence {
+            schema: field_bridge::CALIBRATED_PRESENCE_EVIDENCE_SCHEMA.to_string(),
+            boot_epoch: receipt.boot_epoch.clone(),
+            session_id: receipt.session_id.clone(),
+            model_id: receipt.model_id.clone(),
+            binding_digest: receipt.binding_digest.clone(),
+            source_node_ids: receipt.source_node_ids.clone(),
+            model_completed_at_unix_ms: receipt.completed_at_unix_ms,
+            inference_node_id,
+            source_tick,
+            observed_at_unix_ms,
+            inference_method: occupancy.method.wire_name().to_string(),
+            presence: occupancy.person_count > 0,
+            person_count: occupancy.person_count,
+        })
+    }
+
     fn person_count_at(&self, observed_at_unix_ms: u64) -> usize {
         // A persisted bootstrap model has negative-only authority. Its only
         // allowed occupancy effect is the explicit empty-background suppression
@@ -2223,30 +2386,7 @@ impl AppStateInner {
                 // calibrated against. Applying one node's baseline to a
                 // different radio creates deterministic false occupancy from
                 // hardware-specific amplitude offsets.
-                let bound_source_node_id = (self.calibration_source_node_ids.len() == 1)
-                    .then(|| self.calibration_source_node_ids.iter().next().copied())
-                    .flatten()
-                    .or_else(|| {
-                        self.bootstrap_baseline.as_ref().and_then(|metadata| {
-                            (metadata.source_node_ids.len() == 1)
-                                .then_some(metadata.source_node_ids[0])
-                        })
-                    });
-                let history = if let Some(node_id) = bound_source_node_id {
-                    self.node_states
-                        .get(&node_id)
-                        .map(|state| &state.field_model_history)
-                        .unwrap_or(&self.frame_history)
-                } else if !self.frame_history.is_empty() {
-                    &self.frame_history
-                } else {
-                    self.node_states
-                        .values()
-                        .filter(|ns| !ns.frame_history.is_empty())
-                        .max_by_key(|ns| ns.last_frame_time)
-                        .map(|ns| &ns.frame_history)
-                        .unwrap_or(&self.frame_history)
-                };
+                let history = self.scoring_history();
                 field_bridge::occupancy_or_fallback(
                     fm,
                     history,
@@ -2454,7 +2594,12 @@ impl AppStateInner {
             bootstrap_baseline: None,
             bootstrap_baseline_active: false,
             calibration_model_id: None,
+            calibration_boot_epoch: opaque_calibration_id("cal-boot"),
+            calibration_session_id: None,
+            calibration_binding_digest: None,
             calibration_source_node_ids: std::collections::BTreeSet::new(),
+            calibration_observed_source_node_ids: std::collections::BTreeSet::new(),
+            calibration_model_receipt: None,
             calibration_grid_binding: None,
             calibration_last_sequences: HashMap::new(),
             calibration_reordered_packets: HashMap::new(),
@@ -2540,6 +2685,76 @@ mod calibration_expiry_tests {
             });
         }
         state
+    }
+
+    fn state_with_receipt() -> AppStateInner {
+        let mut state = state_with_model(false);
+        state.calibration_session_id = Some("cal-session-test".to_string());
+        state.calibration_model_id = Some("cal-model-test".to_string());
+        state.calibration_binding_digest = Some("ab".repeat(32));
+        state.calibration_model_receipt = Some(CalibrationModelReceipt {
+            schema: field_bridge::CALIBRATION_MODEL_RECEIPT_SCHEMA,
+            boot_epoch: state.calibration_boot_epoch.clone(),
+            session_id: "cal-session-test".to_string(),
+            model_id: "cal-model-test".to_string(),
+            binding_digest: "ab".repeat(32),
+            source_node_ids: vec![5],
+            frame_count: 1_000,
+            variance_explained: 0.9,
+            baseline_eigenvalue_count: 1,
+            completed_at_unix_ms: 1_000,
+        });
+        state
+    }
+
+    /// The Mac app's held-out empty check consumes this evidence and refuses to
+    /// store a startup baseline without it. Assert the wire schema and every
+    /// identity field the client matches against its receipt.
+    #[test]
+    fn calibrated_presence_evidence_binds_the_active_model_receipt() {
+        let state = state_with_receipt();
+        let evidence = state
+            .calibrated_presence_evidence(5, 77, 1_500)
+            .expect("a fresh explicit calibration must publish calibrated evidence");
+
+        assert_eq!(
+            evidence.schema,
+            field_bridge::CALIBRATED_PRESENCE_EVIDENCE_SCHEMA
+        );
+        assert_eq!(evidence.boot_epoch, state.calibration_boot_epoch);
+        assert_eq!(evidence.session_id, "cal-session-test");
+        assert_eq!(evidence.model_id, "cal-model-test");
+        assert_eq!(evidence.binding_digest, "ab".repeat(32));
+        assert_eq!(evidence.source_node_ids, vec![5]);
+        assert_eq!(evidence.model_completed_at_unix_ms, 1_000);
+        assert_eq!(evidence.inference_node_id, 5);
+        assert_eq!(evidence.source_tick, 77);
+        assert_eq!(evidence.observed_at_unix_ms, 1_500);
+        assert!(!evidence.inference_method.is_empty());
+
+        // The evidence and the server's own count come from one model and one
+        // history, so they can never disagree.
+        assert_eq!(evidence.person_count, state.person_count_at(1_500));
+        assert_eq!(evidence.presence, evidence.person_count > 0);
+    }
+
+    /// Absence must mean "not calibrated", never "the path is broken", so pair
+    /// each refusal with the positive case above.
+    #[test]
+    fn calibrated_presence_evidence_absent_without_an_explicit_fresh_calibration() {
+        // No receipt: the model cannot be attributed to a bound room.
+        let mut no_receipt = state_with_receipt();
+        no_receipt.calibration_model_receipt = None;
+        assert!(no_receipt.calibrated_presence_evidence(5, 77, 1_500).is_none());
+
+        // Bootstrap authority is negative-only and must never publish evidence.
+        let mut bootstrap = state_with_receipt();
+        bootstrap.bootstrap_baseline_active = true;
+        assert!(bootstrap.calibrated_presence_evidence(5, 77, 1_500).is_none());
+
+        // An expired model scores nothing.
+        let expired = state_with_receipt();
+        assert!(expired.calibrated_presence_evidence(5, 77, u64::MAX / 2).is_none());
     }
 
     #[test]
@@ -4096,6 +4311,7 @@ async fn wifi_task(state: SharedState, tick_ms: u64) {
                 &sub_variances,
             ),
             vital_signs: None,
+            calibrated_presence_evidence: None,
             enhanced_motion,
             enhanced_breathing,
             posture: posture_str,
@@ -4261,6 +4477,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
             &sub_variances,
         ),
         vital_signs: None,
+        calibrated_presence_evidence: None,
         enhanced_motion: None,
         enhanced_breathing: None,
         posture: None,
@@ -6853,11 +7070,28 @@ fn edge_vitals_message_for_publication(
     })
 }
 
-fn opaque_calibration_model_id() -> String {
+fn opaque_calibration_id(prefix: &str) -> String {
     let mut bytes = [0_u8; 16];
     OsRng.fill_bytes(&mut bytes);
     let suffix: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("cal-model-{suffix}")
+    format!("{prefix}-{suffix}")
+}
+
+fn opaque_calibration_model_id() -> String {
+    opaque_calibration_id("cal-model")
+}
+
+fn valid_binding_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_source_node_ids(source_node_ids: &[u8]) -> bool {
+    !source_node_ids.is_empty()
+        && source_node_ids.len() <= 16
+        && source_node_ids.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn calibration_source_accepts(
@@ -6880,6 +7114,24 @@ mod bootstrap_vital_publication_tests {
         CsiGridKey {
             n_subcarriers: 64,
             ppdu_type: 0,
+        }
+    }
+
+    fn test_binding_request(source_node_ids: Vec<u8>) -> CalibrationBindingRequest {
+        CalibrationBindingRequest {
+            binding_digest: "a".repeat(64),
+            source_node_ids,
+        }
+    }
+
+    fn bind_test_identity(state: &mut AppStateInner) -> CalibrationIdentityRequest {
+        state.calibration_session_id = Some("cal-session-11111111111111111111111111111111".into());
+        state.calibration_binding_digest = Some("a".repeat(64));
+        CalibrationIdentityRequest {
+            boot_epoch: state.calibration_boot_epoch.clone(),
+            session_id: state.calibration_session_id.clone(),
+            binding_digest: state.calibration_binding_digest.clone(),
+            source_node_ids: Some(state.calibration_source_node_ids.iter().copied().collect()),
         }
     }
 
@@ -6983,6 +7235,7 @@ mod bootstrap_vital_publication_tests {
             Query(CalibrationStartQuery {
                 source_node_id: Some(5),
             }),
+            Json(test_binding_request(vec![5])),
         )
         .await;
         assert_eq!(unavailable["success"], false);
@@ -7012,9 +7265,16 @@ mod bootstrap_vital_publication_tests {
             Query(CalibrationStartQuery {
                 source_node_id: Some(5),
             }),
+            Json(test_binding_request(vec![5])),
         )
         .await;
         assert_eq!(started["success"], true);
+        assert_eq!(started["status"], "uncalibrated");
+        assert_eq!(started["frame_count"], 0);
+        assert_eq!(started["binding_digest"], "a".repeat(64));
+        assert!(started["boot_epoch"].as_str().is_some_and(|value| value.starts_with("cal-boot-") && value.len() == 41));
+        assert!(started["session_id"].as_str().is_some_and(|value| value.starts_with("cal-session-") && value.len() == 44));
+        assert!(started["model_id"].as_str().is_some_and(|value| value.starts_with("cal-model-") && value.len() == 42));
         assert_eq!(started["source_node_ids"], serde_json::json!([5]));
         assert_eq!(started["source_grid"]["n_subcarriers"], 64);
         assert_eq!(started["source_grid"]["ppdu_type"], 0);
@@ -7025,6 +7285,181 @@ mod bootstrap_vital_publication_tests {
         assert_eq!(
             state.calibration_grid_binding.map(|binding| binding.grid),
             Some(test_grid())
+        );
+    }
+
+    #[tokio::test]
+    async fn calibration_status_emits_bound_identity_and_exact_contributions() {
+        let mut inner = AppStateInner::minimal();
+        inner.field_model = Some(FieldModel::new(field_bridge::single_link_config()).expect("field model"));
+        inner.calibration_model_id = Some("cal-model-22222222222222222222222222222222".into());
+        inner.calibration_source_node_ids.extend([5, 7]);
+        inner.calibration_observed_source_node_ids.insert(5);
+        let request = bind_test_identity(&mut inner);
+        let expected_boot_epoch = request.boot_epoch.clone();
+        let state = Arc::new(RwLock::new(inner));
+
+        let Json(status) = calibration_status(State(state)).await;
+        assert_eq!(status["active"], true);
+        assert_eq!(status["binding_mode"], "bound");
+        assert_eq!(status["legacy"], false);
+        assert_eq!(status["boot_epoch"], expected_boot_epoch);
+        assert_eq!(status["session_id"], request.session_id.unwrap());
+        assert_eq!(status["binding_digest"], "a".repeat(64));
+        assert_eq!(status["source_node_ids"], serde_json::json!([5, 7]));
+        assert_eq!(status["observed_source_node_ids"], serde_json::json!([5]));
+        assert_eq!(status["missing_source_node_ids"], serde_json::json!([7]));
+        assert!(status["model_receipt"].is_null());
+    }
+
+    #[tokio::test]
+    async fn calibration_status_emits_idle_process_identity() {
+        let inner = AppStateInner::minimal();
+        let boot_epoch = inner.calibration_boot_epoch.clone();
+        let state = Arc::new(RwLock::new(inner));
+
+        let Json(status) = calibration_status(State(state)).await;
+        assert_eq!(status["active"], false);
+        assert_eq!(status["status"], "none");
+        assert_eq!(status["binding_mode"], "none");
+        assert_eq!(status["legacy"], false);
+        assert_eq!(status["boot_epoch"], boot_epoch);
+        assert!(status["session_id"].is_null());
+        assert_eq!(status["source_node_ids"], serde_json::json!([]));
+        assert_eq!(status["observed_source_node_ids"], serde_json::json!([]));
+        assert_eq!(status["missing_source_node_ids"], serde_json::json!([]));
+    }
+
+    /// A room may bind several radios for identity, but the single-link field
+    /// model has one baseline and one set of amplitude offsets. Only the node
+    /// the grid was bound to may write it; the others stay in the receipt and
+    /// keep their tracking. Measured consequence of the old behaviour: a
+    /// four-node binding finalized with baseline_eigenvalue_count 0 and
+    /// reported an occupant in an empty room.
+    /// A room may bind several radios for identity, but the single-link field
+    /// model has one baseline and one set of amplitude offsets, so only the
+    /// grid-bound radio may author it. The others must still register as
+    /// contributors: `calibration_source_nodes_missing` refuses to finalize a
+    /// capture until every bound node has proven it is live on the frozen
+    /// grid. Gating them out of the feed path entirely deadlocks the capture
+    /// -- measured on hardware: 43,120 frames over 51 minutes stuck in
+    /// `collecting` with missing_source_node_ids=[12,13,14].
+    #[test]
+    fn multi_node_binding_contributes_but_only_the_bound_node_writes_the_baseline() {
+        let mut state = AppStateInner::minimal();
+        state.field_model = Some(
+            FieldModel::new(field_bridge::single_link_config()).expect("field model"),
+        );
+        bind_test_calibration(&mut state);
+        for node_id in [7_u8, 11, 13] {
+            state.calibration_source_node_ids.insert(node_id);
+            state.node_states.entry(node_id).or_insert_with(NodeState::new);
+        }
+        assert_eq!(
+            state.calibration_grid_binding.expect("binding").source_node_id,
+            5
+        );
+
+        // Every bound radio is admitted on the frozen grid.
+        for node_id in [5_u8, 7, 11, 13] {
+            assert!(
+                feed_test_frame(&mut state, node_id, 1, &[0.25; 64]),
+                "node {node_id} must register as a contributor"
+            );
+        }
+
+        // ...so the finalize precondition is satisfiable: nothing is missing.
+        let missing: Vec<u8> = state
+            .calibration_source_node_ids
+            .difference(&state.calibration_observed_source_node_ids)
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "a multi-node binding must still be able to finalize, missing={missing:?}"
+        );
+
+        // But only the bound radio authored the baseline.
+        assert_eq!(
+            state
+                .field_model
+                .as_ref()
+                .expect("field model")
+                .calibration_frame_count(),
+            1,
+            "exactly one radio may write the single-link baseline"
+        );
+
+        // And scoring follows that same radio.
+        assert_eq!(state.bound_source_node_id(), Some(5));
+    }
+
+
+    /// `accept_grid` locks a node onto the densest grid it has seen and
+    /// rejects sparser frames from the feature path -- on an ESP32-C6 the ~16%
+    /// HT 64-bin minority alongside HE-SU 256-bin. Selection must agree, or it
+    /// binds a grid the node is about to stop emitting. Measured consequence:
+    /// a capture bound 64sc, every node locked onto 256sc, the bound grid went
+    /// stale and the capture hung in `collecting` with frame_count frozen.
+    #[test]
+    fn calibration_grid_selection_prefers_the_grid_the_node_keeps_emitting() {
+        let mut node = NodeState::new();
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        let dense = CsiGridKey { n_subcarriers: 256, ppdu_type: 0 };
+        let sparse = CsiGridKey { n_subcarriers: 64, ppdu_type: 0 };
+
+        // The sparse minority trickles in on a perfectly regular cadence, so
+        // its worst-case gap is SMALLER than the dense grid's. The dense grid
+        // is what the radio actually streams, but a single scheduling hiccup
+        // gives it the larger gap. Gap-first ordering therefore picks the
+        // sparse grid -- the one `accept_grid` discards.
+        for i in 0..200_u32 {
+            node.observe_raw_grid(
+                dense,
+                start + std::time::Duration::from_millis(u64::from(i) * 50),
+            );
+        }
+        // one hiccup on the dense stream: a 2 s gap, then it resumes
+        for i in 0..100_u32 {
+            node.observe_raw_grid(
+                dense,
+                start
+                    + std::time::Duration::from_millis(12_000 + u64::from(i) * 50),
+            );
+        }
+        // sparse minority: metronomic 400 ms, never a gap worse than that
+        for i in 0..50_u32 {
+            node.observe_raw_grid(
+                sparse,
+                start + std::time::Duration::from_millis(u64::from(i) * 400),
+            );
+        }
+        node.observe_raw_grid(dense, std::time::Instant::now());
+        node.observe_raw_grid(sparse, std::time::Instant::now());
+
+        // Precondition: the sparse grid really does look smoother, so this
+        // test fails against gap-first ordering rather than passing by luck.
+        let candidates = node.calibration_grid_candidates(std::time::Instant::now());
+        let gap_of = |want: CsiGridKey| {
+            candidates
+                .iter()
+                .find(|(g, _)| *g == want)
+                .map(|(_, e)| e.max_gap_s)
+                .expect("candidate present")
+        };
+        assert!(
+            gap_of(sparse) < gap_of(dense),
+            "test data must make the sparse grid look smoother: sparse={} dense={}",
+            gap_of(sparse),
+            gap_of(dense)
+        );
+
+        let (grid, _) = node
+            .select_calibration_grid(std::time::Instant::now())
+            .expect("a qualifying grid");
+        assert_eq!(
+            grid.n_subcarriers, 256,
+            "selection must bind the grid the node keeps emitting, not the sparse minority admission rejects"
         );
     }
 
@@ -7206,6 +7641,7 @@ mod bootstrap_vital_publication_tests {
         inner.calibration_reordered_packets.insert(5, 3);
         inner.calibration_max_reorder_depth.insert(5, 3);
         inner.calibration_sequence_fault_node_ids.insert(5);
+        let request = bind_test_identity(&mut inner);
         let state = Arc::new(RwLock::new(inner));
 
         let Json(status) = calibration_status(State(state.clone())).await;
@@ -7215,7 +7651,7 @@ mod bootstrap_vital_publication_tests {
         assert_eq!(status["max_reorder_depth_by_node"]["5"], 3);
         assert_eq!(status["sequence_fault_node_ids"], serde_json::json!([5]));
 
-        let Json(stopped) = calibration_stop(State(state)).await;
+        let Json(stopped) = calibration_stop(State(state), Json(request)).await;
         assert_eq!(stopped["success"], false);
         assert_eq!(
             stopped["error_code"],
@@ -7235,9 +7671,11 @@ mod bootstrap_vital_publication_tests {
         );
         inner.calibration_model_id = Some("cal-model-test".to_string());
         inner.calibration_source_node_ids.insert(5);
+        inner.calibration_observed_source_node_ids.insert(5);
+        let request = bind_test_identity(&mut inner);
         let state = Arc::new(RwLock::new(inner));
 
-        let Json(missing) = calibration_stop(State(state.clone())).await;
+        let Json(missing) = calibration_stop(State(state.clone()), Json(request.clone())).await;
         assert_eq!(missing["success"], false);
         assert_eq!(missing["error_code"], "calibration_grid_identity_missing");
 
@@ -7250,7 +7688,7 @@ mod bootstrap_vital_publication_tests {
             });
             state.node_states.insert(5, NodeState::new());
         }
-        let Json(stale) = calibration_stop(State(state)).await;
+        let Json(stale) = calibration_stop(State(state), Json(request)).await;
         assert_eq!(stale["success"], false);
         assert_eq!(stale["error_code"], "calibration_grid_stale");
     }
@@ -7395,6 +7833,39 @@ struct CalibrationStartQuery {
     source_node_id: Option<u8>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct CalibrationBindingRequest {
+    binding_digest: String,
+    source_node_ids: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CalibrationIdentityRequest {
+    boot_epoch: String,
+    session_id: Option<String>,
+    binding_digest: Option<String>,
+    source_node_ids: Option<Vec<u8>>,
+}
+
+fn calibration_identity_matches(s: &AppStateInner, request: &CalibrationIdentityRequest) -> bool {
+    request.boot_epoch == s.calibration_boot_epoch
+        && request.session_id.as_ref() == s.calibration_session_id.as_ref()
+        && request.binding_digest.as_ref() == s.calibration_binding_digest.as_ref()
+        && request.source_node_ids.as_ref().is_some_and(|ids| {
+            ids.iter().copied().collect::<std::collections::BTreeSet<_>>()
+                == s.calibration_source_node_ids
+                && valid_source_node_ids(ids)
+        })
+}
+
+fn calibration_identity_error() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "success": false,
+        "error_code": "calibration_identity_mismatch",
+        "error": "The calibration request does not match the active boot, session, room binding, and node set.",
+    }))
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct BootstrapRefineQuery {
     #[serde(default)]
@@ -7405,10 +7876,23 @@ struct BootstrapRefineQuery {
 async fn calibration_start(
     State(state): State<SharedState>,
     Query(query): Query<CalibrationStartQuery>,
+    Json(request): Json<CalibrationBindingRequest>,
 ) -> Json<serde_json::Value> {
     let mut s = state.write().await;
+    if !valid_binding_digest(&request.binding_digest)
+        || !valid_source_node_ids(&request.source_node_ids)
+    {
+        return Json(serde_json::json!({
+            "success": false,
+            "error_code": "calibration_binding_invalid",
+            "error": "Calibration requires a lowercase SHA-256 room binding and 1 to 16 sorted unique node IDs.",
+        }));
+    }
     let now = std::time::Instant::now();
-    let selected_binding = if let Some(source_node_id) = query.source_node_id {
+    let explicit_source = query
+        .source_node_id
+        .filter(|node_id| request.source_node_ids.binary_search(node_id).is_ok());
+    let selected_binding = if let Some(source_node_id) = explicit_source {
         let Some(node) = s.node_states.get(&source_node_id) else {
             return Json(serde_json::json!({
                 "success": false,
@@ -7436,10 +7920,11 @@ async fn calibration_start(
             evidence: Some(evidence),
         }
     } else {
-        let eligible: Vec<CalibrationGridBinding> = s
-            .node_states
+        let eligible: Vec<CalibrationGridBinding> = request
+            .source_node_ids
             .iter()
-            .filter_map(|(&source_node_id, node)| {
+            .filter_map(|&source_node_id| {
+                let node = s.node_states.get(&source_node_id)?;
                 node.select_calibration_grid(now).map(|(grid, evidence)| {
                     CalibrationGridBinding {
                         source_node_id,
@@ -7449,11 +7934,11 @@ async fn calibration_start(
                 })
             })
             .collect();
-        let [binding] = eligible.as_slice() else {
+        let Some(binding) = eligible.first() else {
             return Json(serde_json::json!({
                 "success": false,
                 "error_code": "calibration_source_required",
-                "error": "Choose exactly one eligible ESP32 source for room calibration.",
+                "error": "None of the bound ESP32 nodes has an eligible raw CSI grid for room calibration.",
                 "eligible_sources": eligible.iter().map(|binding| serde_json::json!({
                     "source_node_id": binding.source_node_id,
                     "grid": binding.grid,
@@ -7492,15 +7977,24 @@ async fn calibration_start(
         Ok(fm) => {
             s.field_model = Some(fm);
             s.calibration_model_id = Some(opaque_calibration_model_id());
+            s.calibration_session_id = Some(opaque_calibration_id("cal-session"));
+            s.calibration_binding_digest = Some(request.binding_digest);
             s.calibration_source_node_ids.clear();
+            s.calibration_observed_source_node_ids.clear();
+            s.calibration_model_receipt = None;
             s.clear_field_model_binding();
             s.clear_calibration_sequence_state();
             s.calibration_source_node_ids
-                .insert(selected_binding.source_node_id);
+                .extend(request.source_node_ids.iter().copied());
             s.calibration_grid_binding = Some(selected_binding);
             Json(serde_json::json!({
                 "success": true,
                 "message": "Calibration started — keep room empty while frames accumulate.",
+                "status": "uncalibrated",
+                "frame_count": 0,
+                "boot_epoch": s.calibration_boot_epoch,
+                "session_id": s.calibration_session_id,
+                "binding_digest": s.calibration_binding_digest,
                 "model_id": s.calibration_model_id,
                 "source_node_ids": s.calibration_source_node_ids,
                 "source_grid": selected_binding.grid,
@@ -7512,8 +8006,14 @@ async fn calibration_start(
     }
 }
 
-async fn calibration_stop(State(state): State<SharedState>) -> Json<serde_json::Value> {
+async fn calibration_stop(
+    State(state): State<SharedState>,
+    Json(request): Json<CalibrationIdentityRequest>,
+) -> Json<serde_json::Value> {
     let mut s = state.write().await;
+    if !calibration_identity_matches(&s, &request) {
+        return calibration_identity_error();
+    }
     let model_id = s.calibration_model_id.clone();
     let source_node_ids: Vec<u8> = s.calibration_source_node_ids.iter().copied().collect();
     let source_grid = s.calibration_grid_binding.map(|binding| binding.grid);
@@ -7541,9 +8041,20 @@ async fn calibration_stop(State(state): State<SharedState>) -> Json<serde_json::
             "source_node_ids": source_node_ids,
         }));
     };
-    if source_node_ids.as_slice() != [binding.source_node_id]
-        || !s.calibration_grid_is_fresh(binding, std::time::Instant::now())
-    {
+    let missing_source_node_ids: Vec<u8> = s
+        .calibration_source_node_ids
+        .difference(&s.calibration_observed_source_node_ids)
+        .copied()
+        .collect();
+    if !missing_source_node_ids.is_empty() {
+        return Json(serde_json::json!({
+            "success": false,
+            "error_code": "calibration_source_nodes_missing",
+            "error": "Every node in the room binding must contribute raw CSI before calibration can be finalized.",
+            "missing_source_node_ids": missing_source_node_ids,
+        }));
+    }
+    if !s.calibration_grid_is_fresh(binding, std::time::Instant::now()) {
         let latest_seen_ms = s
             .node_states
             .get(&binding.source_node_id)
@@ -7603,6 +8114,19 @@ async fn calibration_stop(State(state): State<SharedState>) -> Json<serde_json::
                 let variance_explained = modes.variance_explained;
                 let holdout_window_size = modes.baseline_runtime_window_size;
                 let final_frame_count = fm.calibration_frame_count();
+                let receipt = CalibrationModelReceipt {
+                    schema: field_bridge::CALIBRATION_MODEL_RECEIPT_SCHEMA,
+                    boot_epoch: s.calibration_boot_epoch.clone(),
+                    session_id: s.calibration_session_id.clone().expect("validated identity"),
+                    model_id: model_id.clone().expect("bound calibration model identity"),
+                    binding_digest: s.calibration_binding_digest.clone().expect("validated binding"),
+                    source_node_ids: source_node_ids.clone(),
+                    frame_count: final_frame_count,
+                    variance_explained,
+                    baseline_eigenvalue_count: baseline,
+                    completed_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+                };
+                s.calibration_model_receipt = Some(receipt.clone());
                 s.begin_field_model_holdout(binding);
                 info!("Field model calibrated: baseline_eigenvalues={baseline}, variance_explained={variance_explained:.2}");
                 Json(serde_json::json!({
@@ -7617,6 +8141,7 @@ async fn calibration_stop(State(state): State<SharedState>) -> Json<serde_json::
                     "source_grid": source_grid,
                     "reordered_packets_by_node": reordered_packets_by_node,
                     "max_reorder_depth_by_node": max_reorder_depth_by_node,
+                    "model_receipt": receipt,
                 }))
             }
             // ADR-080 #2: finalize error chain stays server-side only.
@@ -7635,8 +8160,9 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
     let now = std::time::Instant::now();
     let observed_at_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let effective_status = s.field_model_status_at(observed_at_unix_ms);
-    let active = s.field_model_active_at(observed_at_unix_ms);
     let bootstrap_active = s.bootstrap_baseline_active_at(observed_at_unix_ms);
+    let bound = s.calibration_session_id.is_some();
+    let active = bootstrap_active || bound;
     let bootstrap_background_match = s.bootstrap_background_match(observed_at_unix_ms);
     let runtime_reference = s.field_model.as_ref().and_then(|model| {
         model.modes().map(|modes| serde_json::json!({
@@ -7664,6 +8190,14 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
         || "none".to_string(),
         |status| format!("{status:?}").to_lowercase(),
     );
+    // An expired calibration is inactive by definition, but "expired" is a
+    // real, meaningful terminal status distinct from "never calibrated" --
+    // collapsing it to "none" here hid that distinction from callers.
+    let status = if active || status == "expired" {
+        status
+    } else {
+        "none".to_string()
+    };
     let grid_binding = s.calibration_grid_binding.map(|binding| {
         let node = s.node_states.get(&binding.source_node_id);
         let latest_seen_ms = node
@@ -7681,7 +8215,7 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
             { "active" } else { "stale" },
         })
     });
-    Json(serde_json::json!({
+    let mut response = serde_json::json!({
         "active": active,
         "status": status,
         "frame_count": frame_count,
@@ -7699,7 +8233,7 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
         "max_reorder_depth_by_node": s.calibration_max_reorder_depth,
         "sequence_fault_node_ids": s.calibration_sequence_fault_node_ids,
         "runtime_reference": runtime_reference,
-        "binding_mode": if bootstrap_active { "bootstrap_only" } else if active { "runtime" } else { "none" },
+        "binding_mode": if bootstrap_active { "bootstrap_only" } else if bound { "bound" } else { "none" },
         "bootstrap_baseline": s.bootstrap_baseline.as_ref().map(|metadata| serde_json::json!({
             "stored": true,
             "active": bootstrap_active,
@@ -7731,7 +8265,17 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
             "calibrated_evidence_authorized": false,
             "numeric_vitals_authorized": false,
         })),
-    }))
+    });
+    response["boot_epoch"] = serde_json::json!(s.calibration_boot_epoch);
+    response["session_id"] = serde_json::json!(if bound { s.calibration_session_id.clone() } else { None });
+    response["binding_digest"] = serde_json::json!(if bound { s.calibration_binding_digest.clone() } else { None });
+    response["legacy"] = serde_json::json!(false);
+    response["model_id"] = serde_json::json!(if bound { s.calibration_model_id.clone() } else { None });
+    response["model_receipt"] = serde_json::json!(if bound { s.calibration_model_receipt.clone() } else { None });
+    response["source_node_ids"] = serde_json::json!(if bound { s.calibration_source_node_ids.iter().copied().collect::<Vec<_>>() } else { Vec::new() });
+    response["observed_source_node_ids"] = serde_json::json!(if bound { s.calibration_observed_source_node_ids.iter().copied().collect::<Vec<_>>() } else { Vec::new() });
+    response["missing_source_node_ids"] = serde_json::json!(if bound { s.calibration_source_node_ids.difference(&s.calibration_observed_source_node_ids).copied().collect::<Vec<_>>() } else { Vec::new() });
+    Json(response)
 }
 
 /// Validate a completed empty room model against twelve fresh server observed
@@ -7739,9 +8283,13 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
 /// scores, labels, raw CSI, or a replacement model.
 async fn calibration_promote_bootstrap(
     State(state): State<SharedState>,
+    Json(request): Json<CalibrationIdentityRequest>,
 ) -> Json<serde_json::Value> {
     let (expected_model_id, expected_binding, holdout_window_size) = {
         let s = state.read().await;
+        if !calibration_identity_matches(&s, &request) {
+            return calibration_identity_error();
+        }
         let observed_at_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         if s.bootstrap_baseline_active || !s.explicit_calibration_fresh_at(observed_at_unix_ms) {
             return Json(serde_json::json!({
@@ -7952,14 +8500,10 @@ async fn calibration_promote_bootstrap(
             "error": "A stable installation identity is required to store a local startup baseline.",
         }));
     };
-    let source_node_ids: Vec<u8> = s.calibration_source_node_ids.iter().copied().collect();
-    if source_node_ids.len() != 1 {
-        return Json(serde_json::json!({
-            "success": false,
-            "error_code": "calibration_source_nodes_missing",
-            "error": "The single-link startup baseline must contain exactly one contributing ESP32 node.",
-        }));
-    }
+    // Persist the frozen model source only: this remains a deliberately
+    // single-link negative startup prior, while the room receipt retains the
+    // complete multi-node contribution identity.
+    let source_node_ids = vec![expected_binding.source_node_id];
     let Some(field_model) = s.field_model.as_ref() else {
         return Json(serde_json::json!({
             "success": false,
@@ -8242,8 +8786,14 @@ async fn calibration_refine_bootstrap(
 
 /// Cancel only an unfinished capture. Completed model deletion remains on the
 /// administrator scoped reset route.
-async fn calibration_cancel(State(state): State<SharedState>) -> Json<serde_json::Value> {
+async fn calibration_cancel(
+    State(state): State<SharedState>,
+    Json(request): Json<CalibrationIdentityRequest>,
+) -> Json<serde_json::Value> {
     let mut s = state.write().await;
+    if !calibration_identity_matches(&s, &request) {
+        return calibration_identity_error();
+    }
     let cancellable = s.field_model.as_ref().is_some_and(|model| {
         matches!(
             model.status(),
@@ -8257,9 +8807,14 @@ async fn calibration_cancel(State(state): State<SharedState>) -> Json<serde_json
             "error": "Only an unfinished empty room capture can be cancelled.",
         }));
     }
+    let cancelled_session_id = s.calibration_session_id.clone();
     s.field_model = None;
     s.calibration_model_id = None;
+    s.calibration_session_id = None;
+    s.calibration_binding_digest = None;
     s.calibration_source_node_ids.clear();
+    s.calibration_observed_source_node_ids.clear();
+    s.calibration_model_receipt = None;
     s.clear_field_model_binding();
     s.clear_calibration_sequence_state();
     if let Some(installation_id) = s.installation_id.clone() {
@@ -8292,14 +8847,31 @@ async fn calibration_cancel(State(state): State<SharedState>) -> Json<serde_json
         "success": true,
         "message": "Unfinished empty room capture cancelled.",
         "status": if s.bootstrap_baseline_active { "bootstrap" } else { "none" },
+        "frame_count": 0,
+        "boot_epoch": s.calibration_boot_epoch,
+        "cancelled_session_id": cancelled_session_id,
     }))
 }
 
-async fn calibration_reset(State(state): State<SharedState>) -> Json<serde_json::Value> {
+async fn calibration_reset(
+    State(state): State<SharedState>,
+    Json(request): Json<CalibrationIdentityRequest>,
+) -> Json<serde_json::Value> {
     let mut s = state.write().await;
+    let boot_only = request.boot_epoch == s.calibration_boot_epoch
+        && request.session_id.is_none()
+        && request.binding_digest.is_none()
+        && request.source_node_ids.is_none();
+    if !boot_only && !calibration_identity_matches(&s, &request) {
+        return calibration_identity_error();
+    }
     s.field_model = None;
     s.calibration_model_id = None;
+    s.calibration_session_id = None;
+    s.calibration_binding_digest = None;
     s.calibration_source_node_ids.clear();
+    s.calibration_observed_source_node_ids.clear();
+    s.calibration_model_receipt = None;
     s.clear_field_model_binding();
     s.clear_calibration_sequence_state();
     s.bootstrap_baseline_active = false;
@@ -9248,6 +9820,11 @@ async fn udp_receiver_task(
                         let _ = s.tx.send(json);
                     }
 
+                    let calibrated_presence_evidence = s.calibrated_presence_evidence(
+                        node_id,
+                        tick,
+                        chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    );
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
@@ -9258,6 +9835,7 @@ async fn udp_receiver_task(
                         classification,
                         signal_field,
                         vital_signs: published_vitals,
+                        calibrated_presence_evidence,
                         enhanced_motion: None,
                         enhanced_breathing: None,
                         posture: None,
@@ -9751,6 +10329,11 @@ async fn udp_receiver_task(
                         total_persons,
                     );
 
+                    let calibrated_presence_evidence = s.calibrated_presence_evidence(
+                        node_id,
+                        tick,
+                        chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    );
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
@@ -9772,6 +10355,7 @@ async fn udp_receiver_task(
                             &sub_variances,
                         ),
                         vital_signs: published_vitals,
+                        calibrated_presence_evidence,
                         enhanced_motion: None,
                         enhanced_breathing: None,
                         posture: None,
@@ -10027,6 +10611,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
                 &sub_variances,
             ),
             vital_signs: None,
+            calibrated_presence_evidence: None,
             enhanced_motion: None,
             enhanced_breathing: None,
             posture: None,
@@ -11479,10 +12064,15 @@ async fn main() {
         bootstrap_baseline: bootstrap_metadata.clone(),
         bootstrap_baseline_active,
         calibration_model_id: None,
+        calibration_boot_epoch: opaque_calibration_id("cal-boot"),
+        calibration_session_id: None,
+        calibration_binding_digest: None,
         calibration_source_node_ids: bootstrap_metadata
             .as_ref()
             .map(|metadata| metadata.source_node_ids.iter().copied().collect())
             .unwrap_or_default(),
+        calibration_observed_source_node_ids: std::collections::BTreeSet::new(),
+        calibration_model_receipt: None,
         calibration_grid_binding: bootstrap_metadata.as_ref().and_then(|metadata| {
             let [source_node_id] = metadata.source_node_ids.as_slice() else {
                 return None;
@@ -12794,6 +13384,7 @@ mod observatory_persons_field_position_tests {
             },
             signal_field,
             vital_signs: None,
+            calibrated_presence_evidence: None,
             enhanced_motion: None,
             enhanced_breathing: None,
             posture: None,
