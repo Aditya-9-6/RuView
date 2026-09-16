@@ -7809,7 +7809,14 @@ async fn calibration_status(State(state): State<SharedState>) -> Json<serde_json
         || "none".to_string(),
         |status| format!("{status:?}").to_lowercase(),
     );
-    let status = if active { status } else { "none".to_string() };
+    // An expired calibration is inactive by definition, but "expired" is a
+    // real, meaningful terminal status distinct from "never calibrated" --
+    // collapsing it to "none" here hid that distinction from callers.
+    let status = if active || status == "expired" {
+        status
+    } else {
+        "none".to_string()
+    };
     let grid_binding = s.calibration_grid_binding.map(|binding| {
         let node = s.node_states.get(&binding.source_node_id);
         let latest_seen_ms = node
