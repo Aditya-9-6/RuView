@@ -397,6 +397,30 @@ struct CalibrationModelReceipt {
     completed_at_unix_ms: u64,
 }
 
+/// Per-frame occupancy result bound to one immutable field-model calibration
+/// receipt. Absent whenever the model is stale, unavailable, or cannot score
+/// the current observation without a heuristic fallback, so a consumer can
+/// never mistake a fallback for calibrated evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CalibratedPresenceEvidence {
+    schema: String,
+    boot_epoch: String,
+    session_id: String,
+    model_id: String,
+    binding_digest: String,
+    source_node_ids: Vec<u8>,
+    model_completed_at_unix_ms: u64,
+    inference_node_id: u8,
+    source_tick: u64,
+    observed_at_unix_ms: u64,
+    inference_method: String,
+    presence: bool,
+    person_count: usize,
+}
+
+const CALIBRATED_PRESENCE_EVIDENCE_SCHEMA: &str =
+    "ruview.calibration.calibrated-presence-evidence.v2";
+
 /// Sensing update broadcast to WebSocket clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SensingUpdate {
@@ -412,6 +436,10 @@ struct SensingUpdate {
     /// Vital sign estimates (breathing rate, heart rate, confidence).
     #[serde(skip_serializing_if = "Option::is_none")]
     vital_signs: Option<VitalSigns>,
+    /// Strict calibrated occupancy evidence for this frame, bound to the
+    /// active model receipt. Omitted when no calibrated result is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    calibrated_presence_evidence: Option<CalibratedPresenceEvidence>,
     // ── ADR-022 Phase 3: Enhanced multi-BSSID pipeline fields ──
     /// Enhanced motion estimate from multi-BSSID pipeline.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1468,11 +1496,26 @@ impl NodeState {
                     && evidence.max_gap_s < CALIBRATION_GRID_MAX_GAP_S
                     && evidence.latest_age_s < CALIBRATION_GRID_MAX_GAP_S
             })
+            // Density first, to agree with `accept_grid`. That gate locks each
+            // node onto the densest grid it has seen and rejects sparser
+            // frames from the feature path -- on an ESP32-C6 the ~16% HT
+            // 64-bin minority alongside HE-SU 256-bin. Ordering selection by
+            // gap first picked exactly that minority: it is sparse, so its
+            // arrivals look smooth, while the grid the node actually keeps
+            // using scores worse on gap.
+            //
+            // Measured: a capture bound 64sc on node 11, every node then
+            // locked onto 256sc, the bound grid went stale with no frame for
+            // five minutes, frame_count froze at 10,997 and the capture could
+            // never finalize -- `collecting` forever with no error surfaced.
+            // A wider grid that the node will keep emitting beats a narrower
+            // one that admission is designed to discard.
             .min_by(|(left_grid, left), (right_grid, right)| {
-                left.max_gap_s
-                    .total_cmp(&right.max_gap_s)
+                right_grid
+                    .n_subcarriers
+                    .cmp(&left_grid.n_subcarriers)
+                    .then_with(|| left.max_gap_s.total_cmp(&right.max_gap_s))
                     .then_with(|| right.rate_hz.total_cmp(&left.rate_hz))
-                    .then_with(|| right_grid.n_subcarriers.cmp(&left_grid.n_subcarriers))
                     .then_with(|| left_grid.ppdu_type.cmp(&right_grid.ppdu_type))
             })
     }
@@ -2085,8 +2128,10 @@ impl AppStateInner {
         amplitudes: &[f64],
         observed_at: std::time::Instant,
     ) -> bool {
-        // The field model remains single-link, but every radio in the room
-        // binding may contribute bounded observations on the frozen grid.
+        // Every bound radio is admitted this far: `calibration_source_nodes_missing`
+        // requires each one to prove it is present and delivering CSI on the
+        // frozen grid before a capture may finalize. Only writing the baseline
+        // is restricted, below.
         let binding_matches = self
             .calibration_grid_binding
             .is_some_and(|binding| binding.grid == grid);
@@ -2129,12 +2174,33 @@ impl AppStateInner {
             }
             CalibrationSequenceOrder::First | CalibrationSequenceOrder::Forward => {}
         }
+        // The field model is single-link: one baseline, one set of amplitude
+        // offsets. Averaging a second radio's offsets into it flattens the
+        // eigenstructure and leaves only a scalar energy threshold behind.
+        // Measured on three ESP32-C6 nodes: a four-node binding finalized with
+        // baseline_eigenvalue_count 0 and reported an occupant in an empty
+        // room, where the same room on the bound radio alone finalized with 5
+        // and reported absent.
+        //
+        // So only the grid-bound radio writes the baseline. The others still
+        // count as contributors -- they are present on the frozen grid, which
+        // is exactly what the finalize precondition asks -- they simply do not
+        // author the model. This mirrors the narrowing `bootstrap_baseline::store`
+        // already applies when it persists `vec![binding.source_node_id]` as the
+        // frozen model source.
+        let writes_baseline = self
+            .calibration_grid_binding
+            .is_some_and(|binding| binding.source_node_id == node_id);
         let accepted = self.field_model.as_mut().is_some_and(|field| {
             if matches!(
                 field.status(),
                 CalibrationStatus::Uncalibrated | CalibrationStatus::Collecting
             ) {
-                field_bridge::maybe_feed_calibration(field, amplitudes)
+                if writes_baseline {
+                    field_bridge::maybe_feed_calibration(field, amplitudes)
+                } else {
+                    true
+                }
             } else {
                 field.check_freshness(
                     (chrono::Utc::now().timestamp_millis().max(0) as u64)
@@ -2229,6 +2295,82 @@ impl AppStateInner {
     /// "esp32:offline" so the UI can distinguish active vs stale connections.
     /// Person count: eigenvalue-based if field model is calibrated, else heuristic.
     /// Uses global frame_history if populated, otherwise the freshest per-node history.
+    /// The single source node a single-link model is allowed to score, when
+    /// the active calibration (or a restored bootstrap image) bound exactly
+    /// one. `None` means no single node owns the baseline.
+    fn bound_source_node_id(&self) -> Option<u8> {
+        // The grid binding names the one radio that fed the single-link
+        // baseline, whatever the size of the room's node set. Scoring any
+        // other radio against that baseline is the documented false-occupancy
+        // case, so prefer the bound source and never fall back to the shared
+        // mixed-radio history while a binding exists.
+        self.calibration_grid_binding
+            .map(|binding| binding.source_node_id)
+            .or_else(|| {
+                self.bootstrap_baseline.as_ref().and_then(|metadata| {
+                    (metadata.source_node_ids.len() == 1)
+                        .then_some(metadata.source_node_ids[0])
+                })
+            })
+    }
+
+    /// Frame history the field model scores. Shared by `person_count_at` and
+    /// the calibrated presence evidence so the published evidence can never
+    /// disagree with the count derived from the same model.
+    fn scoring_history(&self) -> &VecDeque<Vec<f64>> {
+        if let Some(node_id) = self.bound_source_node_id() {
+            self.node_states
+                .get(&node_id)
+                .map(|state| &state.field_model_history)
+                .unwrap_or(&self.frame_history)
+        } else if !self.frame_history.is_empty() {
+            &self.frame_history
+        } else {
+            self.node_states
+                .values()
+                .filter(|ns| !ns.frame_history.is_empty())
+                .max_by_key(|ns| ns.last_frame_time)
+                .map(|ns| &ns.frame_history)
+                .unwrap_or(&self.frame_history)
+        }
+    }
+
+    /// Strict per-frame calibrated occupancy evidence bound to the active
+    /// model receipt. Returns `None` unless an explicit calibration is fresh
+    /// and the field model scores the observation without falling back to the
+    /// heuristic, so a consumer may treat a present value as calibrated.
+    fn calibrated_presence_evidence(
+        &self,
+        inference_node_id: u8,
+        source_tick: u64,
+        observed_at_unix_ms: u64,
+    ) -> Option<CalibratedPresenceEvidence> {
+        if !self.explicit_calibration_fresh_at(observed_at_unix_ms) {
+            return None;
+        }
+        let receipt = self.calibration_model_receipt.as_ref()?;
+        let occupancy = field_bridge::calibrated_occupancy(
+            self.field_model.as_ref()?,
+            self.scoring_history(),
+            observed_at_unix_ms.saturating_mul(1_000),
+        )?;
+        Some(CalibratedPresenceEvidence {
+            schema: CALIBRATED_PRESENCE_EVIDENCE_SCHEMA.to_string(),
+            boot_epoch: receipt.boot_epoch.clone(),
+            session_id: receipt.session_id.clone(),
+            model_id: receipt.model_id.clone(),
+            binding_digest: receipt.binding_digest.clone(),
+            source_node_ids: receipt.source_node_ids.clone(),
+            model_completed_at_unix_ms: receipt.completed_at_unix_ms,
+            inference_node_id,
+            source_tick,
+            observed_at_unix_ms,
+            inference_method: occupancy.method.wire_name().to_string(),
+            presence: occupancy.person_count > 0,
+            person_count: occupancy.person_count,
+        })
+    }
+
     fn person_count_at(&self, observed_at_unix_ms: u64) -> usize {
         // A persisted bootstrap model has negative-only authority. Its only
         // allowed occupancy effect is the explicit empty-background suppression
@@ -2242,30 +2384,7 @@ impl AppStateInner {
                 // calibrated against. Applying one node's baseline to a
                 // different radio creates deterministic false occupancy from
                 // hardware-specific amplitude offsets.
-                let bound_source_node_id = (self.calibration_source_node_ids.len() == 1)
-                    .then(|| self.calibration_source_node_ids.iter().next().copied())
-                    .flatten()
-                    .or_else(|| {
-                        self.bootstrap_baseline.as_ref().and_then(|metadata| {
-                            (metadata.source_node_ids.len() == 1)
-                                .then_some(metadata.source_node_ids[0])
-                        })
-                    });
-                let history = if let Some(node_id) = bound_source_node_id {
-                    self.node_states
-                        .get(&node_id)
-                        .map(|state| &state.field_model_history)
-                        .unwrap_or(&self.frame_history)
-                } else if !self.frame_history.is_empty() {
-                    &self.frame_history
-                } else {
-                    self.node_states
-                        .values()
-                        .filter(|ns| !ns.frame_history.is_empty())
-                        .max_by_key(|ns| ns.last_frame_time)
-                        .map(|ns| &ns.frame_history)
-                        .unwrap_or(&self.frame_history)
-                };
+                let history = self.scoring_history();
                 field_bridge::occupancy_or_fallback(
                     fm,
                     history,
@@ -2556,6 +2675,76 @@ mod calibration_expiry_tests {
             });
         }
         state
+    }
+
+    fn state_with_receipt() -> AppStateInner {
+        let mut state = state_with_model(false);
+        state.calibration_session_id = Some("cal-session-test".to_string());
+        state.calibration_model_id = Some("cal-model-test".to_string());
+        state.calibration_binding_digest = Some("ab".repeat(32));
+        state.calibration_model_receipt = Some(CalibrationModelReceipt {
+            schema: field_bridge::CALIBRATION_MODEL_RECEIPT_SCHEMA,
+            boot_epoch: state.calibration_boot_epoch.clone(),
+            session_id: "cal-session-test".to_string(),
+            model_id: "cal-model-test".to_string(),
+            binding_digest: "ab".repeat(32),
+            source_node_ids: vec![5],
+            frame_count: 1_000,
+            variance_explained: 0.9,
+            baseline_eigenvalue_count: 1,
+            completed_at_unix_ms: 1_000,
+        });
+        state
+    }
+
+    /// The Mac app's held-out empty check consumes this evidence and refuses to
+    /// store a startup baseline without it. Assert the wire schema and every
+    /// identity field the client matches against its receipt.
+    #[test]
+    fn calibrated_presence_evidence_binds_the_active_model_receipt() {
+        let state = state_with_receipt();
+        let evidence = state
+            .calibrated_presence_evidence(5, 77, 1_500)
+            .expect("a fresh explicit calibration must publish calibrated evidence");
+
+        assert_eq!(
+            evidence.schema,
+            "ruview.calibration.calibrated-presence-evidence.v2"
+        );
+        assert_eq!(evidence.boot_epoch, state.calibration_boot_epoch);
+        assert_eq!(evidence.session_id, "cal-session-test");
+        assert_eq!(evidence.model_id, "cal-model-test");
+        assert_eq!(evidence.binding_digest, "ab".repeat(32));
+        assert_eq!(evidence.source_node_ids, vec![5]);
+        assert_eq!(evidence.model_completed_at_unix_ms, 1_000);
+        assert_eq!(evidence.inference_node_id, 5);
+        assert_eq!(evidence.source_tick, 77);
+        assert_eq!(evidence.observed_at_unix_ms, 1_500);
+        assert!(!evidence.inference_method.is_empty());
+
+        // The evidence and the server's own count come from one model and one
+        // history, so they can never disagree.
+        assert_eq!(evidence.person_count, state.person_count_at(1_500));
+        assert_eq!(evidence.presence, evidence.person_count > 0);
+    }
+
+    /// Absence must mean "not calibrated", never "the path is broken", so pair
+    /// each refusal with the positive case above.
+    #[test]
+    fn calibrated_presence_evidence_absent_without_an_explicit_fresh_calibration() {
+        // No receipt: the model cannot be attributed to a bound room.
+        let mut no_receipt = state_with_receipt();
+        no_receipt.calibration_model_receipt = None;
+        assert!(no_receipt.calibrated_presence_evidence(5, 77, 1_500).is_none());
+
+        // Bootstrap authority is negative-only and must never publish evidence.
+        let mut bootstrap = state_with_receipt();
+        bootstrap.bootstrap_baseline_active = true;
+        assert!(bootstrap.calibrated_presence_evidence(5, 77, 1_500).is_none());
+
+        // An expired model scores nothing.
+        let expired = state_with_receipt();
+        assert!(expired.calibrated_presence_evidence(5, 77, u64::MAX / 2).is_none());
     }
 
     #[test]
@@ -4112,6 +4301,7 @@ async fn wifi_task(state: SharedState, tick_ms: u64) {
                 &sub_variances,
             ),
             vital_signs: None,
+            calibrated_presence_evidence: None,
             enhanced_motion,
             enhanced_breathing,
             posture: posture_str,
@@ -4277,6 +4467,7 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
             &sub_variances,
         ),
         vital_signs: None,
+        calibrated_presence_evidence: None,
         enhanced_motion: None,
         enhanced_breathing: None,
         posture: None,
@@ -7082,6 +7273,139 @@ mod bootstrap_vital_publication_tests {
         assert_eq!(status["missing_source_node_ids"], serde_json::json!([]));
     }
 
+    /// A room may bind several radios for identity, but the single-link field
+    /// model has one baseline and one set of amplitude offsets. Only the node
+    /// the grid was bound to may write it; the others stay in the receipt and
+    /// keep their tracking. Measured consequence of the old behaviour: a
+    /// four-node binding finalized with baseline_eigenvalue_count 0 and
+    /// reported an occupant in an empty room.
+    /// A room may bind several radios for identity, but the single-link field
+    /// model has one baseline and one set of amplitude offsets, so only the
+    /// grid-bound radio may author it. The others must still register as
+    /// contributors: `calibration_source_nodes_missing` refuses to finalize a
+    /// capture until every bound node has proven it is live on the frozen
+    /// grid. Gating them out of the feed path entirely deadlocks the capture
+    /// -- measured on hardware: 43,120 frames over 51 minutes stuck in
+    /// `collecting` with missing_source_node_ids=[12,13,14].
+    #[test]
+    fn multi_node_binding_contributes_but_only_the_bound_node_writes_the_baseline() {
+        let mut state = AppStateInner::minimal();
+        state.field_model = Some(
+            FieldModel::new(field_bridge::single_link_config()).expect("field model"),
+        );
+        bind_test_calibration(&mut state);
+        for node_id in [7_u8, 11, 13] {
+            state.calibration_source_node_ids.insert(node_id);
+            state.node_states.entry(node_id).or_insert_with(NodeState::new);
+        }
+        assert_eq!(
+            state.calibration_grid_binding.expect("binding").source_node_id,
+            5
+        );
+
+        // Every bound radio is admitted on the frozen grid.
+        for node_id in [5_u8, 7, 11, 13] {
+            assert!(
+                feed_test_frame(&mut state, node_id, 1, &[0.25; 64]),
+                "node {node_id} must register as a contributor"
+            );
+        }
+
+        // ...so the finalize precondition is satisfiable: nothing is missing.
+        let missing: Vec<u8> = state
+            .calibration_source_node_ids
+            .difference(&state.calibration_observed_source_node_ids)
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "a multi-node binding must still be able to finalize, missing={missing:?}"
+        );
+
+        // But only the bound radio authored the baseline.
+        assert_eq!(
+            state
+                .field_model
+                .as_ref()
+                .expect("field model")
+                .calibration_frame_count(),
+            1,
+            "exactly one radio may write the single-link baseline"
+        );
+
+        // And scoring follows that same radio.
+        assert_eq!(state.bound_source_node_id(), Some(5));
+    }
+
+
+    /// `accept_grid` locks a node onto the densest grid it has seen and
+    /// rejects sparser frames from the feature path -- on an ESP32-C6 the ~16%
+    /// HT 64-bin minority alongside HE-SU 256-bin. Selection must agree, or it
+    /// binds a grid the node is about to stop emitting. Measured consequence:
+    /// a capture bound 64sc, every node locked onto 256sc, the bound grid went
+    /// stale and the capture hung in `collecting` with frame_count frozen.
+    #[test]
+    fn calibration_grid_selection_prefers_the_grid_the_node_keeps_emitting() {
+        let mut node = NodeState::new();
+        let start = std::time::Instant::now() - std::time::Duration::from_secs(20);
+        let dense = CsiGridKey { n_subcarriers: 256, ppdu_type: 0 };
+        let sparse = CsiGridKey { n_subcarriers: 64, ppdu_type: 0 };
+
+        // The sparse minority trickles in on a perfectly regular cadence, so
+        // its worst-case gap is SMALLER than the dense grid's. The dense grid
+        // is what the radio actually streams, but a single scheduling hiccup
+        // gives it the larger gap. Gap-first ordering therefore picks the
+        // sparse grid -- the one `accept_grid` discards.
+        for i in 0..200_u32 {
+            node.observe_raw_grid(
+                dense,
+                start + std::time::Duration::from_millis(u64::from(i) * 50),
+            );
+        }
+        // one hiccup on the dense stream: a 2 s gap, then it resumes
+        for i in 0..100_u32 {
+            node.observe_raw_grid(
+                dense,
+                start
+                    + std::time::Duration::from_millis(12_000 + u64::from(i) * 50),
+            );
+        }
+        // sparse minority: metronomic 400 ms, never a gap worse than that
+        for i in 0..50_u32 {
+            node.observe_raw_grid(
+                sparse,
+                start + std::time::Duration::from_millis(u64::from(i) * 400),
+            );
+        }
+        node.observe_raw_grid(dense, std::time::Instant::now());
+        node.observe_raw_grid(sparse, std::time::Instant::now());
+
+        // Precondition: the sparse grid really does look smoother, so this
+        // test fails against gap-first ordering rather than passing by luck.
+        let candidates = node.calibration_grid_candidates(std::time::Instant::now());
+        let gap_of = |want: CsiGridKey| {
+            candidates
+                .iter()
+                .find(|(g, _)| *g == want)
+                .map(|(_, e)| e.max_gap_s)
+                .expect("candidate present")
+        };
+        assert!(
+            gap_of(sparse) < gap_of(dense),
+            "test data must make the sparse grid look smoother: sparse={} dense={}",
+            gap_of(sparse),
+            gap_of(dense)
+        );
+
+        let (grid, _) = node
+            .select_calibration_grid(std::time::Instant::now())
+            .expect("a qualifying grid");
+        assert_eq!(
+            grid.n_subcarriers, 256,
+            "selection must bind the grid the node keeps emitting, not the sparse minority admission rejects"
+        );
+    }
+
     #[test]
     fn non_bound_grid_never_enters_field_model_history() {
         let mut state = AppStateInner::minimal();
@@ -9412,6 +9736,11 @@ async fn udp_receiver_task(
                         let _ = s.tx.send(json);
                     }
 
+                    let calibrated_presence_evidence = s.calibrated_presence_evidence(
+                        node_id,
+                        tick,
+                        chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    );
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
@@ -9422,6 +9751,7 @@ async fn udp_receiver_task(
                         classification,
                         signal_field,
                         vital_signs: published_vitals,
+                        calibrated_presence_evidence,
                         enhanced_motion: None,
                         enhanced_breathing: None,
                         posture: None,
@@ -9915,6 +10245,11 @@ async fn udp_receiver_task(
                         total_persons,
                     );
 
+                    let calibrated_presence_evidence = s.calibrated_presence_evidence(
+                        node_id,
+                        tick,
+                        chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    );
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
@@ -9936,6 +10271,7 @@ async fn udp_receiver_task(
                             &sub_variances,
                         ),
                         vital_signs: published_vitals,
+                        calibrated_presence_evidence,
                         enhanced_motion: None,
                         enhanced_breathing: None,
                         posture: None,
@@ -10191,6 +10527,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
                 &sub_variances,
             ),
             vital_signs: None,
+            calibrated_presence_evidence: None,
             enhanced_motion: None,
             enhanced_breathing: None,
             posture: None,
@@ -12960,6 +13297,7 @@ mod observatory_persons_field_position_tests {
             },
             signal_field,
             vital_signs: None,
+            calibrated_presence_evidence: None,
             enhanced_motion: None,
             enhanced_breathing: None,
             posture: None,
