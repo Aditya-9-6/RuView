@@ -419,9 +419,6 @@ struct CalibratedPresenceEvidence {
     person_count: usize,
 }
 
-const CALIBRATED_PRESENCE_EVIDENCE_SCHEMA: &str =
-    "ruview.calibration.calibrated-presence-evidence.v2";
-
 /// Sensing update broadcast to WebSocket clients
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SensingUpdate {
@@ -2360,7 +2357,7 @@ impl AppStateInner {
             observed_at_unix_ms.saturating_mul(1_000),
         )?;
         Some(CalibratedPresenceEvidence {
-            schema: CALIBRATED_PRESENCE_EVIDENCE_SCHEMA.to_string(),
+            schema: field_bridge::CALIBRATED_PRESENCE_EVIDENCE_SCHEMA.to_string(),
             boot_epoch: receipt.boot_epoch.clone(),
             session_id: receipt.session_id.clone(),
             model_id: receipt.model_id.clone(),
@@ -2722,7 +2719,7 @@ mod calibration_expiry_tests {
 
         assert_eq!(
             evidence.schema,
-            "ruview.calibration.calibrated-presence-evidence.v2"
+            field_bridge::CALIBRATED_PRESENCE_EVIDENCE_SCHEMA
         );
         assert_eq!(evidence.boot_epoch, state.calibration_boot_epoch);
         assert_eq!(evidence.session_id, "cal-session-test");

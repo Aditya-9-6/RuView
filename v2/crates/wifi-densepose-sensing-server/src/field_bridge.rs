@@ -19,6 +19,11 @@ use super::score_to_person_count;
 pub const CALIBRATION_MODEL_RECEIPT_SCHEMA: &str =
     "ruview.calibration.field-model-receipt.v1";
 
+/// Versioned schema for per-frame calibrated occupancy evidence bound to a
+/// model receipt, published on the sensing stream.
+pub const CALIBRATED_PRESENCE_EVIDENCE_SCHEMA: &str =
+    "ruview.calibration.calibrated-presence-evidence.v2";
+
 /// Length-only canonicalizer for calibration frames (issue #1170 pattern,
 /// shared with `multistatic_bridge`). Raw ESP32 amplitudes arrive at the
 /// hardware's native width (HT20 ≈ 64, HT40 ≈ 128/192); the FieldModel is
