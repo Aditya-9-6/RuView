@@ -32,7 +32,7 @@ matching chip build through the documented backup and flash process once. The
 USB protocol rejects public target addresses and invalid identifiers. New WiFi
 credentials are bounded, committed only in NVS, and never included in the
 receipt or diagnostic output. See
-[ADR 348](../../docs/adr/ADR-348-native-macos-usb-node-onboarding.md).
+[ADR 363](../../docs/adr/ADR-363-native-macos-usb-node-onboarding.md).
 
 On ESP32 C6, the default optional mmWave UART uses GPIO 4 and GPIO 5. Firmware
 refuses any mmWave configuration that overlaps the active console pins. This
