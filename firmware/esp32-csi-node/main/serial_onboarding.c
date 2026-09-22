@@ -46,7 +46,7 @@ static void device_digest(char output[17])
     uint8_t digest_input[sizeof(domain) - 1 + sizeof(base_mac)];
     size_t digest_length = 0;
     memcpy(digest_input, domain, sizeof(domain) - 1);
-    const esp_err_t mac_result = esp_efuse_mac_get_default(base_mac);
+    const esp_err_t mac_result = esp_base_mac_addr_get(base_mac);
     if (mac_result == ESP_OK) {
         memcpy(digest_input + sizeof(domain) - 1, base_mac, sizeof(base_mac));
     }
