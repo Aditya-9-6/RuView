@@ -16,7 +16,7 @@ static void run_test(const char *label, const uint8_t mac[6], const char *expect
 {
     char out[17] = {0};
     /* Force the stub to return the supplied MAC and success */
-    esp_stub_set_mac(mac, sizeof(mac));
+    esp_stub_set_mac(mac, 6);
     esp_stub_set_base_mac_result(ESP_OK);
 
     device_digest(out);
@@ -29,7 +29,7 @@ static void run_test(const char *label, const uint8_t mac[6], const char *expect
 
 static void test_fallback(void)
 {
-    char out[15] = {0};
+    char out[17] = {0};
     esp_stub_set_base_mac_result(ESP_FAIL);   // simulate failure
     device_digest(out);
     if (strcmp(out, "0000000000000000") != 0) {
